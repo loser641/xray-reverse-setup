@@ -2,6 +2,8 @@
 
 一个面向**中转 VPS** 的交互式部署脚本：多台落地设备（手机/家宽）主动回连 VPS 建立专属反向隧道，外部用户接入后，其**全部流量**由对应的落地设备出口，一一对应、无需分流。
 
+支持 **Alpine Linux（OpenRC）**、**Debian**、**Ubuntu（systemd）**，单个脚本自动识别初始化系统，只依赖系统自带工具，无需额外安装 bash。
+
 - 用户 `user1` 接入 VPS → 流量经隧道 1 → 落地设备 1 出口
 - 用户 `user2` 接入 VPS → 流量经隧道 2 → 落地设备 2 出口
 - 依此类推，每个用户对应一台专属落地设备
@@ -46,11 +48,14 @@ flowchart LR
 
 ## 特性
 
+- 单个 POSIX `sh` 脚本，Alpine / Debian / Ubuntu 通用，自动识别 systemd 与 OpenRC
+- 只依赖系统自带工具（wget 或 curl、sed、awk、tr、cut 等），不额外安装 bash
+- 小内存友好：安装、校验、生成配置均为轻量操作，常驻仅 Xray 单进程
 - 交互式一键部署，所有凭证自动生成：UUID、REALITY X25519 密钥对、VLESS Encryption 对、shortId
 - 支持 N 个用户，第 N 个用户自动对应第 N 台落地设备（隧道 tag、UUID、配置文件一一对应）
-- 自动安装 Xray：优先使用官方安装脚本 [XTLS/Xray-install](https://github.com/XTLS/Xray-install)，也可手动下载
+- 自动安装 Xray：systemd 系统用官方脚本 [XTLS/Xray-install](https://github.com/XTLS/Xray-install)，Alpine 用其官方 OpenRC 专属安装脚本，也可手动下载
 - 写入配置前自动备份；写入后执行 `xray run -test` 校验，失败自动还原旧配置
-- 自动创建 systemd 服务并放行 ufw 端口（若已启用）
+- 自动创建 systemd 或 OpenRC 服务并放行 ufw 端口（Debian/Ubuntu 且 ufw 启用时）
 - 为每台落地设备单独生成一份客户端配置 `/root/xray-bridge-<email>.jsonc`
 - 末尾打印每个用户的 VLESS 分享链接与 UUID 对应关系表
 
@@ -65,22 +70,27 @@ README.md               本文档
 
 ### 前置条件
 
-- 一台有公网 IP 的 Linux VPS（Debian/Ubuntu 等，使用 systemd），能以 root 执行
+- 一台有公网 IP 的 Linux VPS：Debian / Ubuntu（systemd）或 Alpine Linux（OpenRC），能以 root 执行
 - 云厂商安全组 / 防火墙放行两个 TCP 端口（默认 `443`、`8443`，可在脚本中修改）
 - 落地设备：安装 v2rayNG（Android）或 v2rayN（Windows）等支持自定义配置的客户端
 
 ### 运行
 
 ```bash
-sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/loser641/xray-reverse-setup/main/xray-reverse-setup.sh)"
+wget -O xray-reverse-setup.sh https://raw.githubusercontent.com/loser641/xray-reverse-setup/main/xray-reverse-setup.sh
+chmod +x xray-reverse-setup.sh
+./xray-reverse-setup.sh
 ```
 
-或先下载再执行：
+需要 root（`su -` 或 `sudo` 均可）。没有 wget 时可用 curl：
 
 ```bash
 curl -fsSL -o xray-reverse-setup.sh https://raw.githubusercontent.com/loser641/xray-reverse-setup/main/xray-reverse-setup.sh
-sudo bash xray-reverse-setup.sh
+chmod +x xray-reverse-setup.sh
+./xray-reverse-setup.sh
 ```
+
+> 脚本为 `#!/bin/sh`，Alpine 上由自带的 busybox ash 直接执行，无需安装 bash。
 
 ### 交互参数
 
@@ -101,7 +111,7 @@ sudo bash xray-reverse-setup.sh
 | --- | --- | --- |
 | 服务端配置 | `/usr/local/etc/xray/config.json` | JSONC，含中文注释 |
 | 旧配置备份 | `/usr/local/etc/xray/config.json.bak.<时间戳>` | 覆盖前自动生成 |
-| systemd 服务 | `/etc/systemd/system/xray.service` | 已启用并启动 |
+| systemd / OpenRC 服务 | `/etc/systemd/system/xray.service` 或 `/etc/init.d/xray` | 已启用并启动 |
 | 落地设备配置 | `/root/xray-bridge-<email>.jsonc` | 每个用户一份，拷贝到对应设备导入 |
 | 分享链接 | 脚本末尾打印 | 每个用户一条 |
 
@@ -109,11 +119,21 @@ sudo bash xray-reverse-setup.sh
 
 ### 方式一：官方安装脚本（推荐）
 
+**Debian / Ubuntu（systemd）**：
+
 ```bash
 bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
 ```
 
-官方安装脚本（[XTLS/Xray-install](https://github.com/XTLS/Xray-install)）的约定：
+**Alpine Linux（OpenRC）**：官方主安装脚本仅支持 systemd，因此使用 XTLS/Xray-install 仓库中独立的 Alpine 安装脚本（脚本内部自动处理）：
+
+```sh
+apk add curl
+curl -O -L https://github.com/XTLS/Xray-install/raw/main/alpinelinux/install-release.sh
+ash install-release.sh
+```
+
+官方安装脚本（[XTLS/Xray-install](https://github.com/XTLS/Xray-install)，含 [Alpine/OpenRC 专属说明](https://github.com/XTLS/Xray-install/tree/main/alpinelinux)）的约定：
 
 - 二进制：`/usr/local/bin/xray`
 - 配置目录：`/usr/local/etc/xray/`（主配置 `config.json`）
@@ -125,7 +145,7 @@ bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release
 常用命令：
 
 ```bash
-# 仅更新地理数据
+# 仅更新地理数据（systemd 系统）
 bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install-geodata
 
 # 卸载（保留配置与日志）
@@ -264,15 +284,26 @@ journalctl -u xray -n 50       # 查看最近日志
 xray run -test -c /usr/local/etc/xray/config.json   # 仅校验配置
 ```
 
+Alpine（OpenRC）：
+
+```sh
+rc-service xray status         # 查看服务状态
+rc-service xray restart        # 重启
+rc-update add xray             # 设置开机自启
+rc-service xray checkconfig    # 校验配置
+```
+
 常见问题：
 
 | 现象 | 排查方向 |
 | --- | --- |
-| 用户连不上 VPS | 云厂商安全组/ufw 是否放行接入端口；REALITY target 是否可达；SNI/shortId 与分享链接是否一致 |
+| 用户连不上 VPS | 云厂商安全组/防火墙是否放行接入端口（Alpine 默认无防火墙，多为云安全组）；REALITY target 是否可达；SNI/shortId 与分享链接是否一致 |
 | 连上但无法上网 | 对应落地设备是否在线（隧道未建立）；落地端是否取消 VPN 弹窗（代理模式）；落地端 `home-direct` 是否放行公网 |
 | 只有部分用户能用 | 检查路由规则与 tunnel 编号是否一一对应；用户 email 是否与分享链接的 UUID 对应 |
 | 配置报错 | `xray run -test` 查看具体错误；脚本失败时会自动还原备份配置 |
 | 隧道掉线 | 手机后台被杀；给 v2rayNG 加电池白名单/允许自启动，或使用保活方案 |
+
+小内存 VPS 提示：Xray 单进程常驻内存约几十 MB；脚本本身不额外占用常驻资源，安装完成后会自动清理下载的临时文件。
 
 ## 安全建议
 
@@ -286,6 +317,7 @@ xray run -test -c /usr/local/etc/xray/config.json   # 仅校验配置
 - Xray-core 官方全量文档：<https://xtls.github.io/llms-full.txt>
 - 官方 VLESS 反向代理示例：<https://xtls.github.io/document/level-2/vless_reverse.html>
 - 官方安装脚本：<https://github.com/XTLS/Xray-install>
+- Alpine/OpenRC 专属安装说明：<https://github.com/XTLS/Xray-install/tree/main/alpinelinux>
 - VLESS 分享链接标准提案：<https://github.com/XTLS/Xray-core/discussions/716>
 - v2rayNG：<https://github.com/2dust/v2rayNG>
 - v2rayN：<https://github.com/2dust/v2rayN>
@@ -294,4 +326,5 @@ xray run -test -c /usr/local/etc/xray/config.json   # 仅校验配置
 
 - **一对一专属隧道**：官方文档详细示例了多条回连共用同一 `reverse.tag` 形成可用池（N 对 N），未直接给出“每个用户一条专属隧道”的多用户示例；本脚本基于文档确认的字段组合实现（每个客户端独立 `reverse.tag` + 按 `user` 路由到指定 `outboundTag`）。
 - **分享链接**：格式遵循官方文档引用的分享链接标准提案；不同客户端的导入行为以其各自文档为准。
-- **systemd 单元与 ufw**：属于系统部署层面，官方 Xray 文档未规定具体写法，脚本采用常规配置。
+- **systemd/OpenRC 服务单元与 ufw**：属于系统部署层面，官方 Xray 文档未规定具体写法；脚本参照官方 XTLS/Xray-install 提供的模板实现。
+- **Alpine 手动安装路径**：若官方 Alpine 安装脚本不可用，脚本会回退到手动下载；Alpine 上解压依赖 `unzip`（busybox 自带或 `apk add unzip`），这属于系统工具而非脚本功能。
