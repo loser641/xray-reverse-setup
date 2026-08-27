@@ -53,6 +53,8 @@ flowchart LR
 - 小内存友好：安装、校验、生成配置均为轻量操作，常驻仅 Xray 单进程
 - 交互式一键部署，所有凭证自动生成：UUID、REALITY X25519 密钥对、VLESS Encryption 对、shortId
 - 支持 N 个用户，第 N 个用户自动对应第 N 台落地设备（隧道 tag、UUID、配置文件一一对应）
+- 可选：额外添加一个出口为中转 VPS 直连的 VLESS Reality 节点（SNI 与主入口一致，默认 itunes.apple.com）
+- target 为 CDN 域名时询问是否启用回落限速（`limitFallbackUpload` / `limitFallbackDownload`），防止未授权流量被偷跑
 - 自动安装 Xray：systemd 系统用官方脚本 [XTLS/Xray-install](https://github.com/XTLS/Xray-install)，Alpine 用其官方 OpenRC 专属安装脚本，也可手动下载
 - 写入配置前自动备份；写入后执行 `xray run -test` 校验，失败自动还原旧配置
 - 自动创建 systemd 或 OpenRC 服务并放行 ufw 端口（Debian/Ubuntu 且 ufw 启用时）
@@ -103,6 +105,8 @@ chmod +x xray-reverse-setup.sh
 | SNI 列表 | target 的主机名 | 逗号分隔 |
 | shortId | 随机生成 | 16 位以内十六进制，位数必须为偶数（文档限制） |
 | 用户 email 列表 | `user1,user2` | 第 N 个用户对应第 N 台落地设备 |
+| 是否添加 VPS 直连节点 | `Y` | 额外生成一个出口为中转 VPS 的 VLESS Reality 用户（SNI 与主入口一致） |
+| 是否启用 CDN 回落限速 | `Y` | target 为 CDN 域名时，防止未授权流量被偷跑（文档字段 `limitFallbackUpload`/`limitFallbackDownload`） |
 | VLESS Encryption 认证 | X25519 | 可选 ML-KEM-768（后量子，更长），服务端与客户端必须一致 |
 
 ### 脚本完成后的产物
@@ -209,6 +213,21 @@ bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release
 
 > 文档确认：VLESS 默认必须配合传输安全层；**只有启用 VLESS Encryption 后**，`streamSettings.security` 才允许为 `none`。隧道入口正是利用这一条，用 Encryption 保护载荷、以明文 TCP 外观回连，适合不暴露公网入口的落地设备。
 
+### 可选：VPS 直连节点
+
+若在交互中确认添加，REALITY 入站的 `users` 数组会额外多出一个用户（默认 email `direct`），路由规则为 `user: ["direct"] → direct`，其流量直接由中转 VPS 出口，不进入任何反向隧道，分享链接在脚本末尾与落地用户一并打印。
+
+### 可选：CDN 回落限速
+
+REALITY 伪装目标默认是 `itunes.apple.com` 这类 CDN 域名。官方文档警告：当 target 为 CDN 时，未通过 REALITY 鉴权的连接会被直接转发到 target，相当于把 VPS 变成 CDN 的端口转发器，可能被扫描后偷跑流量。脚本在确认添加直连节点后询问是否启用回落限速，启用时会在 `realitySettings` 中生成（数值采用文档示例）：
+
+```jsonc
+"limitFallbackUpload":   { "afterBytes": 10485760, "bytesPerSec": 1048576, "burstBytesPerSec": 5242880 },
+"limitFallbackDownload": { "afterBytes": 10485760, "bytesPerSec": 1048576, "burstBytesPerSec": 5242880 }
+```
+
+文档同时提到前置 Nginx 过滤 SNI 等替代方案，脚本未实现。
+
 ### 3. 路由：全量一一对应
 
 ```jsonc
@@ -252,6 +271,8 @@ vless://<UUID>@<VPS_IP>:443?security=reality&flow=xtls-rprx-vision&type=tcp&sni=
 **v2rayNG（Android）**：复制分享链接 → 右上角 `+` → 从剪贴板导入。
 
 **v2rayN（Windows）**：服务器 → 添加 [VLESS] 服务器（或从剪贴板导入链接）。
+
+若添加了 VPS 直连节点，脚本末尾会额外打印一条标注“（VPS 直连）”的分享链接，该节点与落地用户共用同一个 REALITY 入口（同一 SNI、shortId、密钥），只是出口为中转 VPS 本身。
 
 ## 落地设备部署（手机/家宽）
 
@@ -328,3 +349,4 @@ rc-service xray checkconfig    # 校验配置
 - **分享链接**：格式遵循官方文档引用的分享链接标准提案；不同客户端的导入行为以其各自文档为准。
 - **systemd/OpenRC 服务单元与 ufw**：属于系统部署层面，官方 Xray 文档未规定具体写法；脚本参照官方 XTLS/Xray-install 提供的模板实现。
 - **Alpine 手动安装路径**：若官方 Alpine 安装脚本不可用，脚本会回退到手动下载；Alpine 上解压依赖 `unzip`（busybox 自带或 `apk add unzip`），这属于系统工具而非脚本功能。
+- **回落限速数值**：`limitFallbackUpload`/`limitFallbackDownload` 为官方文档确认字段，脚本默认采用文档示例中的数值（约 10 MB 后限速 1 MB/s、突发 5 MB/s），可按需在生成的配置中调整；文档还提到前置 Nginx 过滤 SNI 等防偷跑替代方案。

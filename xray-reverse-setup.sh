@@ -12,6 +12,8 @@
 #   - 每个用户对应一台专属落地设备（手机/家宽），该设备主动回连 VPS 建立反向隧道；
 #   - 用户 N 的全部流量经 reverse-out-N 送入专属隧道，由落地设备 N 出口；
 #   - 不需要分流，全部转发。
+#   - 可选：额外添加一个出口为中转 VPS 直连的 VLESS Reality 节点；
+#     target 为 CDN 域名时可启用回落限速（文档字段），防止未授权流量被偷跑。
 #
 # 依据：
 #   配置字段均以 Xray-core 官方全量文档（https://xtls.github.io/llms-full.txt）
@@ -281,7 +283,42 @@ build_reality_users() {
     printf '          { "id": "%s", "email": "%s", "flow": "xtls-rprx-vision" }' "$(cat "$WD/u${_i}.ext")" "$_email"
     _i=$((_i + 1))
   done
+  # 可选的 VPS 直连节点（出口为中转 VPS）
+  if [ "$DIRECT_ENABLED" = "1" ]; then
+    printf ',\n'
+    printf '          { "id": "%s", "email": "%s", "flow": "xtls-rprx-vision" }' "$(cat "$WD/direct.uuid")" "$DIRECT_EMAIL"
+  fi
   printf '\n'
+}
+
+# 生成路由规则：用户 N 的全部流量 -> reverse-out-N；直连节点 -> direct
+build_routing_rules() {
+  _i=1
+  _first=1
+  while [ "$_i" -le "$N_USERS" ]; do
+    _email=$(sed -n "${_i}p" "$WD/emails")
+    if [ "$_first" -eq 1 ]; then
+      _first=0
+    else
+      printf ',\n'
+    fi
+    printf '      { "user": ["%s"], "outboundTag": "reverse-out-%d" }' "$_email" "$_i"
+    _i=$((_i + 1))
+  done
+  if [ "$DIRECT_ENABLED" = "1" ]; then
+    printf ',\n'
+    printf '      { "user": ["%s"], "outboundTag": "direct" }' "$DIRECT_EMAIL"
+  fi
+  printf '\n'
+}
+
+# CDN target 回落限速（官方文档确认字段），防止未授权流量被偷跑
+fallback_limit_json() {
+  if [ "$FALLBACK_LIMIT" = "1" ]; then
+    printf ',\n'
+    printf '          "limitFallbackUpload": { "afterBytes": 10485760, "bytesPerSec": 1048576, "burstBytesPerSec": 5242880 },\n'
+    printf '          "limitFallbackDownload": { "afterBytes": 10485760, "bytesPerSec": 1048576, "burstBytesPerSec": 5242880 }\n'
+  fi
 }
 
 # 生成隧道入站（落地设备回连）的 users 数组条目，每个用户独立 reverse tag
@@ -295,23 +332,6 @@ build_bridge_users() {
       printf ',\n'
     fi
     printf '          { "id": "%s", "flow": "xtls-rprx-vision", "reverse": { "tag": "reverse-out-%d" } }' "$(cat "$WD/u${_i}.br")" "$_i"
-    _i=$((_i + 1))
-  done
-  printf '\n'
-}
-
-# 生成路由规则：用户 N 的全部流量 -> reverse-out-N（不附加任何域名/IP 条件）
-build_routing_rules() {
-  _i=1
-  _first=1
-  while [ "$_i" -le "$N_USERS" ]; do
-    _email=$(sed -n "${_i}p" "$WD/emails")
-    if [ "$_first" -eq 1 ]; then
-      _first=0
-    else
-      printf ',\n'
-    fi
-    printf '      { "user": ["%s"], "outboundTag": "reverse-out-%d" }' "$_email" "$_i"
     _i=$((_i + 1))
   done
   printf '\n'
@@ -341,10 +361,11 @@ $(build_reality_users)
         "method": "raw",
         "security": "reality",
         "realitySettings": {
+          // target 为 CDN 域名时，文档建议启用回落限速，防止未授权流量被偷跑
           "target": "${REALITY_TARGET}",
           "serverNames": [$(json_str_array "$SNIS")],
           "privateKey": "${REALITY_PRIVATE_KEY}",
-          "shortIds": ["${SHORT_ID}"]
+          "shortIds": ["${SHORT_ID}"]$(fallback_limit_json)
         }
       },
       "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] }
@@ -563,6 +584,10 @@ print_links() {
       "$_email" "$(cat "$WD/u${_i}.ext")" "$VPS_HOST" "$REALITY_PORT" "$SNI_HOST" "$REALITY_PUBLIC_KEY" "$SHORT_ID" "$_email"
     _i=$((_i + 1))
   done
+  if [ "$DIRECT_ENABLED" = "1" ]; then
+    printf '    %s（VPS 直连）: vless://%s@%s:%s?security=reality&flow=xtls-rprx-vision&type=tcp&sni=%s&pbk=%s&sid=%s&fp=chrome#%s-direct\n' \
+      "$DIRECT_EMAIL" "$(cat "$WD/direct.uuid")" "$VPS_HOST" "$REALITY_PORT" "$SNI_HOST" "$REALITY_PUBLIC_KEY" "$SHORT_ID" "$DIRECT_EMAIL"
+  fi
 }
 
 # 部署结果汇总
@@ -586,6 +611,13 @@ print_summary() {
     echo "    落地设备配置 : /root/xray-bridge-${_safe}.jsonc"
     _i=$((_i + 1))
   done
+  if [ "$DIRECT_ENABLED" = "1" ]; then
+    echo "  直连节点 ${DIRECT_EMAIL}（出口为中转 VPS）"
+    echo "    外部接入 UUID : $(cat "$WD/direct.uuid")"
+    if [ "$FALLBACK_LIMIT" = "1" ]; then
+      echo "    CDN 回落限速 : 已启用（limitFallbackUpload / limitFallbackDownload）"
+    fi
+  fi
   echo
   if confirm "打印客户端分享链接？" "Y"; then
     print_links
@@ -608,6 +640,9 @@ main() {
   INIT=$(detect_init)
   info "检测到初始化系统：${INIT}"
   [ "$INIT" != "none" ] || warn "未检测到 systemd/OpenRC，将跳过服务自动配置。"
+
+  DIRECT_ENABLED=0
+  FALLBACK_LIMIT=0
 
   WD=$(mktemp -d "${TMPDIR:-/tmp}/xray-setup.XXXXXX") || WD="/tmp/xray-setup.$$"
   mkdir -p "$WD"
@@ -681,6 +716,21 @@ main() {
   info "共 ${N_USERS} 个用户：$(tr '\n' ',' < "$WD/emails" | sed 's/,$//')"
 
   gen_all_uuids
+
+  echo
+  if confirm "是否额外添加一个出口为中转 VPS 直连的 VLESS Reality 节点？（SNI 与主入口一致，默认 itunes.apple.com）" "Y"; then
+    DIRECT_ENABLED=1
+    DIRECT_EMAIL=$(ask "直连节点用户 email" "direct")
+    [ -n "$DIRECT_EMAIL" ] || die "直连节点 email 不能为空。"
+    if grep -qx "$DIRECT_EMAIL" "$WD/emails"; then
+      die "直连节点 email 与落地用户重复：$DIRECT_EMAIL"
+    fi
+    xray uuid > "$WD/direct.uuid"
+    echo
+    if confirm "注意：REALITY target（${REALITY_TARGET}）为 CDN 域名，为防止未授权流量被偷跑，是否启用回落限速？" "Y"; then
+      FALLBACK_LIMIT=1
+    fi
+  fi
 
   echo
   info "VLESS Encryption 认证方式（文档确认二者均可，服务端与客户端必须一致）："
