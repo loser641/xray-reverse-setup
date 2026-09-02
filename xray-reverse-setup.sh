@@ -12,8 +12,7 @@
 #   - 每个用户对应一台专属落地设备（手机/家宽），该设备主动回连 VPS 建立反向隧道；
 #   - 用户 N 的全部流量经 reverse-out-N 送入专属隧道，由落地设备 N 出口；
 #   - 不需要分流，全部转发。
-#   - 可选：额外添加一个出口为中转 VPS 直连的 VLESS Reality 节点；
-#     target 为 CDN 域名时可启用回落限速（文档字段），防止未授权流量被偷跑。
+#   - 可选：额外添加一个出口为中转 VPS 直连的 VLESS Reality 节点。
 #
 # 依据：
 #   配置字段均以 Xray-core 官方全量文档（https://xtls.github.io/llms-full.txt）
@@ -269,7 +268,7 @@ gen_all_uuids() {
   done
 }
 
-# 生成 REALITY 入站（用户接入）的 users 数组条目
+# 生成 REALITY 入站（用户接入）的 clients 数组条目
 build_reality_users() {
   _i=1
   _first=1
@@ -312,16 +311,7 @@ build_routing_rules() {
   printf '\n'
 }
 
-# CDN target 回落限速（官方文档确认字段），防止未授权流量被偷跑
-fallback_limit_json() {
-  if [ "$FALLBACK_LIMIT" = "1" ]; then
-    printf ',\n'
-    printf '          "limitFallbackUpload": { "afterBytes": 10485760, "bytesPerSec": 1048576, "burstBytesPerSec": 5242880 },\n'
-    printf '          "limitFallbackDownload": { "afterBytes": 10485760, "bytesPerSec": 1048576, "burstBytesPerSec": 5242880 }\n'
-  fi
-}
-
-# 生成隧道入站（落地设备回连）的 users 数组条目，每个用户独立 reverse tag
+# 生成隧道入站（落地设备回连）的 clients 数组条目，每个用户独立 reverse tag
 build_bridge_users() {
   _i=1
   _first=1
@@ -353,7 +343,7 @@ write_server_config() {
       "protocol": "vless",
       "settings": {
         "decryption": "none",
-        "users": [
+        "clients": [
 $(build_reality_users)
         ]
       },
@@ -361,11 +351,10 @@ $(build_reality_users)
         "method": "raw",
         "security": "reality",
         "realitySettings": {
-          // target 为 CDN 域名时，文档建议启用回落限速，防止未授权流量被偷跑
           "target": "${REALITY_TARGET}",
           "serverNames": [$(json_str_array "$SNIS")],
           "privateKey": "${REALITY_PRIVATE_KEY}",
-          "shortIds": ["${SHORT_ID}"]$(fallback_limit_json)
+          "shortIds": ["${SHORT_ID}"]
         }
       },
       "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] }
@@ -380,7 +369,7 @@ $(build_reality_users)
       "protocol": "vless",
       "settings": {
         "decryption": "${DECRYPTION}",
-        "users": [
+        "clients": [
 $(build_bridge_users)
         ]
       },
@@ -619,9 +608,6 @@ print_summary() {
   if [ "$DIRECT_ENABLED" = "1" ]; then
     echo "  直连节点 ${DIRECT_EMAIL}（出口为中转 VPS）"
     echo "    外部接入 UUID : $(cat "$WD/direct.uuid")"
-    if [ "$FALLBACK_LIMIT" = "1" ]; then
-      echo "    CDN 回落限速 : 已启用（limitFallbackUpload / limitFallbackDownload）"
-    fi
   fi
   echo
   if confirm "打印客户端分享链接？" "Y"; then
@@ -647,7 +633,6 @@ main() {
   [ "$INIT" != "none" ] || warn "未检测到 systemd/OpenRC，将跳过服务自动配置。"
 
   DIRECT_ENABLED=0
-  FALLBACK_LIMIT=0
 
   WD=$(mktemp -d "${TMPDIR:-/tmp}/xray-setup.XXXXXX") || WD="/tmp/xray-setup.$$"
   mkdir -p "$WD"
@@ -731,10 +716,6 @@ main() {
       die "直连节点 email 与落地用户重复：$DIRECT_EMAIL"
     fi
     xray uuid > "$WD/direct.uuid"
-    echo
-    if confirm "注意：REALITY target（${REALITY_TARGET}）为 CDN 域名，为防止未授权流量被偷跑，是否启用回落限速？" "Y"; then
-      FALLBACK_LIMIT=1
-    fi
   fi
 
   echo
