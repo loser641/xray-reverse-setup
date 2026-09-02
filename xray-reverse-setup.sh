@@ -1,23 +1,28 @@
 #!/bin/sh
 # =============================================================================
-# Xray VLESS 反向代理（多用户一对一落地）中转 VPS 交互式部署脚本
+# Xray VLESS 反向代理（多场景一对一落地）中转 VPS 交互式部署脚本
 #
 # 适用系统：Alpine Linux（OpenRC）/ Debian / Ubuntu（systemd）
 # 依赖：仅使用系统自带工具（sh、wget 或 curl、sed、awk、tr、cut 等），
-#       不额外安装 bash；unzip 仅在“手动下载安装”时会用到（Alpine 可用
-#       busybox unzip，或 apk add unzip）。
+#       不额外安装 bash；unzip 仅在“手动下载安装”时会用到。
 #
-# 用途：
-#   - 外部用户 user1/user2/... 通过 VLESS + REALITY 接入 VPS；
-#   - 每个用户对应一台专属落地设备（手机/家宽），该设备主动回连 VPS 建立反向隧道；
-#   - 用户 N 的全部流量经 reverse-out-N 送入专属隧道，由落地设备 N 出口；
-#   - 不需要分流，全部转发。
-#   - 可选：额外添加一个出口为中转 VPS 直连的 VLESS Reality 节点。
+# 四种场景（VPS 均在国内/国外以“设备相对 GFW 的位置”理解）：
+#   方案1：出口设备在国外，入口设备在国内
+#         -> 入口用 VLESS+REALITY，出口隧道用 VLESS Encryption
+#   方案2：入口设备在国外，出口设备在国内
+#         -> 入口用 VLESS Encryption，出口隧道用 VLESS+REALITY
+#   方案3：出入口设备都在国外
+#         -> 两端都用 VLESS Encryption
+#   方案4：出入口设备都在国内
+#         -> 两端都用 VLESS+REALITY
+#   原则：哪一端设备在国内，那一端就用 VLESS+REALITY 伪装；国外端用简单
+#         VLESS Encryption 即可。可一次选择多个方案（如 12/1234）。
+#   可选：额外添加一个出口为中转 VPS 的 VLESS+REALITY 单节点。
 #
 # 依据：
 #   配置字段均以 Xray-core 官方全量文档（https://xtls.github.io/llms-full.txt）
-#   中确认过的字段、取值与限制为准；安装与服务管理参考官方
-#   XTLS/Xray-install（含 Alpine/OpenRC 专属说明）。
+#   中确认过的字段与限制为准；VLESS 入站统一使用 clients（实测运行时仅
+#   clients 生效）；安装与服务管理参考官方 XTLS/Xray-install（含 Alpine/OpenRC）。
 #
 # 用法：
 #   ./xray-reverse-setup.sh          （需 root）
@@ -39,7 +44,6 @@ err()  { printf "${C_RED}[x]${C_RESET} %s\n" "$*" >&2; }
 
 die() { err "$*"; exit 1; }
 
-# 带默认值的交互输入：输出用户输入或默认值
 ask() {
   _ask_prompt="$1"
   _ask_def="$2"
@@ -52,7 +56,6 @@ ask() {
   printf '%s\n' "${_ask_ans:-$_ask_def}"
 }
 
-# 确认提问：默认 Y 返回 0，否则返回 1
 confirm() {
   _cf_prompt="$1"
   _cf_def="$2"
@@ -65,7 +68,6 @@ confirm() {
   esac
 }
 
-# HTTP 下载到标准输出（优先 wget，其次 curl）
 http_get() {
   if command -v wget >/dev/null 2>&1; then
     wget -qO- "$1"
@@ -76,7 +78,6 @@ http_get() {
   fi
 }
 
-# HTTP 下载到文件
 http_download() {
   if command -v wget >/dev/null 2>&1; then
     wget -qO "$2" "$1"
@@ -87,7 +88,6 @@ http_download() {
   fi
 }
 
-# 端口校验：1-65535
 valid_port() {
   case "$1" in
     ''|*[!0-9]*) return 1 ;;
@@ -98,22 +98,16 @@ valid_port() {
   return 1
 }
 
-# shortId 校验：文档确认要求为 0-f 十六进制、位数必须为偶数、不超过 16 位
 valid_short_id() {
   case "$1" in
     *[!0-9a-fA-F]*) return 1 ;;
   esac
   _sid_len=${#1}
-  if [ $((_sid_len % 2)) -ne 0 ]; then
-    return 1
-  fi
-  if [ "$_sid_len" -gt 16 ]; then
-    return 1
-  fi
+  if [ $((_sid_len % 2)) -ne 0 ]; then return 1; fi
+  if [ "$_sid_len" -gt 16 ]; then return 1; fi
   return 0
 }
 
-# 架构检测，输出对应的 GitHub Release 文件名
 detect_arch() {
   case "$(uname -m)" in
     x86_64|amd64)  echo "Xray-linux-64.zip" ;;
@@ -122,7 +116,6 @@ detect_arch() {
   esac
 }
 
-# 检测初始化系统：systemd / openrc / none
 detect_init() {
   if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
     echo "systemd"
@@ -157,7 +150,46 @@ json_str_array() {
   printf '%s' "$_js_out"
 }
 
-# 安装或确认 Xray
+# 校验方案选择：只允许 1-4 的数字组合
+validate_cases() {
+  case "$1" in
+    ''|*[!1-4]*) return 1 ;;
+  esac
+  return 0
+}
+
+# 方案 -> 入口/隧道协议
+entry_proto_of() { # 1/4 -> reality; 2/3 -> enc
+  case "$1" in
+    1|4) echo "reality" ;;
+    *) echo "enc" ;;
+  esac
+}
+bridge_proto_of() { # 1/3 -> enc; 2/4 -> reality
+  case "$1" in
+    2|4) echo "reality" ;;
+    *) echo "enc" ;;
+  esac
+}
+
+# 默认端口建议
+default_entry_port() {
+  case "$1" in
+    1) echo 40143 ;;
+    2) echo 40243 ;;
+    3) echo 40343 ;;
+    4) echo 40443 ;;
+  esac
+}
+default_bridge_port() {
+  case "$1" in
+    1) echo 50143 ;;
+    2) echo 50243 ;;
+    3) echo 50343 ;;
+    4) echo 50443 ;;
+  esac
+}
+
 install_xray() {
   if command -v xray >/dev/null 2>&1; then
     if xray vlessenc >/dev/null 2>&1; then
@@ -166,7 +198,7 @@ install_xray() {
         return 0
       fi
     else
-      warn "检测到 Xray，但缺少 vlessenc 命令（版本过旧），需要升级后才能生成 VLESS Encryption 配置。"
+      warn "检测到 Xray，但缺少 vlessenc 命令（版本过旧）。"
       confirm "继续升级到最新版？" "Y" || die "需要新版 Xray，请升级后重试。"
     fi
   fi
@@ -176,7 +208,7 @@ install_xray() {
   if [ "$INIT" = "openrc" ]; then
     echo "  1) 官方 Alpine 安装脚本（XTLS/Xray-install alpinelinux，推荐）"
   else
-    echo "  1) 官方安装脚本 XTLS/Xray-install（官方文档确认的 Linux 安装脚本，推荐）"
+    echo "  1) 官方安装脚本 XTLS/Xray-install（推荐）"
   fi
   echo "  2) 手动从 GitHub Releases 下载"
   echo "  3) 跳过（稍后自行处理）"
@@ -213,7 +245,7 @@ install_xray() {
           apt-get install -y -qq unzip >/dev/null
           _unzip_cmd="unzip"
         else
-          die "未找到 unzip，且无法自动安装，请先安装 unzip 后重试。"
+          die "未找到 unzip 且无法自动安装，请先安装 unzip 后重试。"
         fi
       fi
       (
@@ -239,7 +271,6 @@ install_xray() {
   info "Xray 版本：$(xray version | head -n 1)"
 }
 
-# 生成 REALITY 密钥对，写入全局变量
 gen_reality_keys() {
   _x25519_out=$(xray x25519)
   REALITY_PRIVATE_KEY=$(printf '%s\n' "$_x25519_out" | sed -n 's/^PrivateKey: \(.*\)/\1/p')
@@ -247,7 +278,6 @@ gen_reality_keys() {
   [ -n "$REALITY_PRIVATE_KEY" ] && [ -n "$REALITY_PUBLIC_KEY" ] || die "解析 x25519 输出失败。"
 }
 
-# 生成 VLESS Encryption 对，auth=x25519|mlkem，写入 DECRYPTION / ENCRYPTION
 gen_vlessenc() {
   _ve_auth="$1"
   _ve_n=1
@@ -258,133 +288,122 @@ gen_vlessenc() {
   [ -n "$DECRYPTION" ] && [ -n "$ENCRYPTION" ] || die "解析 vlessenc 输出失败。"
 }
 
-# 生成每个用户的外部接入 UUID 与隧道回连 UUID，存入 $WD/u<i>.ext / $WD/u<i>.br
-gen_all_uuids() {
-  _i=1
-  while [ "$_i" -le "$N_USERS" ]; do
-    xray uuid > "$WD/u${_i}.ext"
-    xray uuid > "$WD/u${_i}.br"
-    _i=$((_i + 1))
-  done
+# ---------- JSON 片段生成 ----------
+
+# REALITY stream 设置（缩进 8 空格用于 streamSettings 内）
+reality_stream_block() {
+  printf '        "method": "raw",\n'
+  printf '        "security": "reality",\n'
+  printf '        "realitySettings": {\n'
+  printf '          "target": "%s",\n' "$REALITY_TARGET"
+  printf '          "serverNames": [%s],\n' "$(json_str_array "$SNIS")"
+  printf '          "privateKey": "%s",\n' "$REALITY_PRIVATE_KEY"
+  printf '          "shortIds": ["%s"]\n' "$SHORT_ID"
+  printf '        }\n'
 }
 
-# 生成 REALITY 入站（用户接入）的 clients 数组条目
-build_reality_users() {
-  _i=1
+enc_stream_block() {
+  printf '        "method": "raw",\n'
+  printf '        "security": "none"\n'
+}
+
+# 单个 VLESS 入站：proto = reality|enc
+# $1=tag $2=port $3=proto $4=id $5=email(可空) $6=reverse-tag(可空) $7=说明注释
+emit_inbound() {
+  _tag="$1"; _port="$2"; _proto="$3"; _id="$4"; _email="$5"; _rev="$6"; _note="$7"
+  printf '    {\n'
+  printf '      // %s\n' "$_note"
+  printf '      "tag": "%s",\n' "$_tag"
+  printf '      "listen": "0.0.0.0",\n'
+  printf '      "port": %s,\n' "$_port"
+  printf '      "protocol": "vless",\n'
+  printf '      "settings": {\n'
+  if [ "$_proto" = "enc" ]; then
+    printf '        "decryption": "%s",\n' "$DECRYPTION"
+  else
+    printf '        "decryption": "none",\n'
+  fi
+  printf '        "clients": [\n'
+  if [ -n "$_rev" ]; then
+    printf '          { "id": "%s", "flow": "xtls-rprx-vision", "reverse": { "tag": "%s" } }\n' "$_id" "$_rev"
+  elif [ -n "$_email" ]; then
+    printf '          { "id": "%s", "email": "%s", "flow": "xtls-rprx-vision" }\n' "$_id" "$_email"
+  else
+    printf '          { "id": "%s", "flow": "xtls-rprx-vision" }\n' "$_id"
+  fi
+  printf '        ]\n'
+  printf '      },\n'
+  printf '      "streamSettings": {\n'
+  if [ "$_proto" = "enc" ]; then
+    enc_stream_block
+  else
+    reality_stream_block
+  fi
+  printf '      }\n'
+  printf '    }\n'
+}
+
+# 组装全部 inbounds
+emit_inbounds() {
   _first=1
-  while [ "$_i" -le "$N_USERS" ]; do
-    _email=$(sed -n "${_i}p" "$WD/emails")
-    if [ "$_first" -eq 1 ]; then
-      _first=0
+  for _c in $CASES; do
+    _ep=$(cat "$WD/c${_c}.entry_port")
+    _bp=$(cat "$WD/c${_c}.bridge_port")
+    _eid=$(cat "$WD/c${_c}.entry_id")
+    _bid=$(cat "$WD/c${_c}.bridge_id")
+    _eemail=$(cat "$WD/c${_c}.entry_email")
+    _eproto=$(entry_proto_of "$_c")
+    _bproto=$(bridge_proto_of "$_c")
+    [ "$_first" -eq 1 ] || printf ',\n'
+    _first=0
+    if [ "$_eproto" = "reality" ]; then
+      emit_inbound "user-case-${_c}" "$_ep" reality "$_eid" "$_eemail" "" "方案${_c} 用户接入（VLESS+REALITY）-> reverse-out-${_c}"
     else
-      printf ',\n'
+      emit_inbound "user-case-${_c}" "$_ep" enc "$_eid" "$_eemail" "" "方案${_c} 用户接入（VLESS Encryption）-> reverse-out-${_c}"
     fi
-    printf '          { "id": "%s", "email": "%s", "flow": "xtls-rprx-vision" }' "$(cat "$WD/u${_i}.ext")" "$_email"
-    _i=$((_i + 1))
+    printf ',\n'
+    if [ "$_bproto" = "reality" ]; then
+      emit_inbound "bridge-case-${_c}" "$_bp" reality "$_bid" "" "reverse-out-${_c}" "方案${_c} 隧道入口（VLESS+REALITY）"
+    else
+      emit_inbound "bridge-case-${_c}" "$_bp" enc "$_bid" "" "reverse-out-${_c}" "方案${_c} 隧道入口（VLESS Encryption）"
+    fi
   done
-  # 可选的 VPS 直连节点（出口为中转 VPS）
   if [ "$DIRECT_ENABLED" = "1" ]; then
     printf ',\n'
-    printf '          { "id": "%s", "email": "%s", "flow": "xtls-rprx-vision" }' "$(cat "$WD/direct.uuid")" "$DIRECT_EMAIL"
+    emit_inbound "user-direct" "$DIRECT_PORT" reality "$(cat "$WD/direct.uuid")" "$DIRECT_EMAIL" "" "中转 VPS 直连节点（VLESS+REALITY）"
   fi
   printf '\n'
 }
 
-# 生成路由规则：用户 N 的全部流量 -> reverse-out-N；直连节点 -> direct
-build_routing_rules() {
-  _i=1
+emit_routing_rules() {
   _first=1
-  while [ "$_i" -le "$N_USERS" ]; do
-    _email=$(sed -n "${_i}p" "$WD/emails")
-    if [ "$_first" -eq 1 ]; then
-      _first=0
-    else
-      printf ',\n'
-    fi
-    printf '      { "user": ["%s"], "outboundTag": "reverse-out-%d" }' "$_email" "$_i"
-    _i=$((_i + 1))
+  for _c in $CASES; do
+    if [ "$_first" -eq 1 ]; then _first=0; else printf ',\n'; fi
+    printf '      { "inboundTag": ["user-case-%s"], "outboundTag": "reverse-out-%s" }' "$_c" "$_c"
   done
   if [ "$DIRECT_ENABLED" = "1" ]; then
     printf ',\n'
-    printf '      { "user": ["%s"], "outboundTag": "direct" }' "$DIRECT_EMAIL"
+    printf '      { "inboundTag": ["user-direct"], "outboundTag": "direct" }'
   fi
   printf '\n'
 }
 
-# 生成隧道入站（落地设备回连）的 clients 数组条目，每个用户独立 reverse tag
-build_bridge_users() {
-  _i=1
-  _first=1
-  while [ "$_i" -le "$N_USERS" ]; do
-    if [ "$_first" -eq 1 ]; then
-      _first=0
-    else
-      printf ',\n'
-    fi
-    printf '          { "id": "%s", "flow": "xtls-rprx-vision", "reverse": { "tag": "reverse-out-%d" } }' "$(cat "$WD/u${_i}.br")" "$_i"
-    _i=$((_i + 1))
-  done
-  printf '\n'
-}
-
-# 写入服务端配置（JSONC，含中文注释）
 write_server_config() {
   cat > "$CONF" <<EOF
 {
   // 日志级别：debug / info / warning / error / none（官方文档确认）
   "log": { "loglevel": "warning" },
   "inbounds": [
-    {
-      // 用户接入入口：VLESS + REALITY（RAW/TCP）
-      // 文档确认：serverNames/privateKey/shortIds 为必填；target 与旧名 dest 互为别名
-      "tag": "user-in",
-      "listen": "0.0.0.0",
-      "port": ${REALITY_PORT},
-      "protocol": "vless",
-      "settings": {
-        "decryption": "none",
-        "clients": [
-$(build_reality_users)
-        ]
-      },
-      "streamSettings": {
-        "method": "raw",
-        "security": "reality",
-        "realitySettings": {
-          "target": "${REALITY_TARGET}",
-          "serverNames": [$(json_str_array "$SNIS")],
-          "privateKey": "${REALITY_PRIVATE_KEY}",
-          "shortIds": ["${SHORT_ID}"]
-        }
-      },
-      "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] }
-    },
-    {
-      // 隧道入口：VLESS + VLESS Encryption
-      // 每个落地设备使用自己的 UUID 与独立 reverse tag，形成一一对应的专属隧道
-      // 文档确认：启用 VLESS Encryption 后，streamSettings.security 才允许为 none
-      "tag": "bridge-in",
-      "listen": "0.0.0.0",
-      "port": ${BRIDGE_PORT},
-      "protocol": "vless",
-      "settings": {
-        "decryption": "${DECRYPTION}",
-        "clients": [
-$(build_bridge_users)
-        ]
-      },
-      "streamSettings": { "method": "raw", "security": "none" }
-    }
+$(emit_inbounds)
   ],
   "outbounds": [
-    // 文档强调：公网服务器必须保留明确的默认出站，否则未命中规则的流量可能误入反向隧道
+    // 文档强调：公网服务器必须保留明确的默认出站，避免未命中规则误入反向隧道
     { "protocol": "freedom", "tag": "direct" }
   ],
   "routing": {
-    // 全量转发：仅按用户 email 匹配，不附加任何域名/IP 条件
     "domainStrategy": "AsIs",
     "rules": [
-$(build_routing_rules)
+$(emit_routing_rules)
     ]
   }
 }
@@ -392,7 +411,181 @@ EOF
   chmod 644 "$CONF"
 }
 
-# 配置服务并启动（systemd 或 OpenRC）
+# ---------- 客户端配置生成 ----------
+
+# VLESS+REALITY 客户端 stream 段（缩进 6 空格，用于 outbound streamSettings）
+client_reality_stream() {
+  printf '      "streamSettings": {\n'
+  printf '        "method": "raw",\n'
+  printf '        "security": "reality",\n'
+  printf '        "realitySettings": {\n'
+  printf '          "serverName": "%s",\n' "$SNI_HOST"
+  printf '          "fingerprint": "chrome",\n'
+  printf '          "password": "%s",\n' "$REALITY_PUBLIC_KEY"
+  printf '          "shortId": "%s"\n' "$SHORT_ID"
+  printf '        }\n'
+  printf '      }\n'
+}
+
+client_enc_stream() {
+  printf '      "streamSettings": { "method": "raw", "security": "none" }\n'
+}
+
+# 出口（隧道）设备配置：$1=case
+write_bridge_client() {
+  _c="$1"
+  _bid=$(cat "$WD/c${_c}.bridge_id")
+  _bp=$(cat "$WD/c${_c}.bridge_port")
+  _bproto=$(bridge_proto_of "$_c")
+  _f="/root/xray-bridge-case${_c}.jsonc"
+  cat > "$_f" <<EOF
+{
+  // 方案${_c} 出口设备（落地）配置：主动连接 VPS:${_bp} 建立反向隧道
+  // v2rayNG 自定义配置导入 / v2rayN 添加自定义配置服务器；保持在线
+  "log": { "loglevel": "warning" },
+  "inbounds": [],
+  "outbounds": [
+    { "protocol": "freedom" },
+    {
+      "protocol": "freedom",
+      "tag": "home-direct",
+      "settings": {
+        "finalRules": [
+          { "action": "allow", "network": "tcp,udp", "ip": ["!geoip:private"] }
+        ]
+      }
+    },
+    {
+      "protocol": "vless",
+      "tag": "to-vps",
+      "settings": {
+        "address": "${VPS_HOST}",
+        "port": ${_bp},
+        "id": "${_bid}",
+        "encryption": "$(if [ "$_bproto" = "reality" ]; then printf 'none'; else printf '%s' "$ENCRYPTION"; fi)",
+        "flow": "xtls-rprx-vision",
+        "reverse": { "tag": "reverse-in-${_c}" }
+      },
+$(if [ "$_bproto" = "reality" ]; then client_reality_stream; else client_enc_stream; fi)
+    }
+  ],
+  "routing": {
+    "domainStrategy": "AsIs",
+    "rules": [
+      { "inboundTag": ["reverse-in-${_c}"], "outboundTag": "home-direct" }
+    ]
+  }
+}
+EOF
+  info "已生成：$_f（方案${_c} 出口设备导入此文件并保持在线）"
+}
+
+# 入口设备为 VLESS Encryption（方案2/3）时的客户端配置：$1=case
+write_entry_enc_client() {
+  _c="$1"
+  _eid=$(cat "$WD/c${_c}.entry_id")
+  _ep=$(cat "$WD/c${_c}.entry_port")
+  _f="/root/xray-entry-case${_c}.jsonc"
+  cat > "$_f" <<EOF
+{
+  // 方案${_c} 入口设备配置（VLESS Encryption，设备在境外无需伪装）
+  // 提供本地 SOCKS 127.0.0.1:1080；若用 v2rayNG/v2rayN 自定义配置，请把本地
+  // 入站端口改为客户端要求的值，或仅作为纯出站导入使用。
+  "log": { "loglevel": "warning" },
+  "inbounds": [
+    { "listen": "127.0.0.1", "port": 1080, "protocol": "socks", "settings": { "udp": true } }
+  ],
+  "outbounds": [
+    {
+      "protocol": "vless",
+      "tag": "proxy",
+      "settings": {
+        "address": "${VPS_HOST}",
+        "port": ${_ep},
+        "id": "${_eid}",
+        "encryption": "${ENCRYPTION}",
+        "flow": "xtls-rprx-vision"
+      },
+$(client_enc_stream)
+    },
+    { "protocol": "freedom", "tag": "direct" }
+  ]
+}
+EOF
+  info "已生成：$_f（方案${_c} 入口设备境外端配置）"
+}
+
+# 入口设备为 REALITY 时的分享链接：$1=case
+print_case_link() {
+  _c="$1"
+  _eid=$(cat "$WD/c${_c}.entry_id")
+  _ep=$(cat "$WD/c${_c}.entry_port")
+  printf '    方案%s: vless://%s@%s:%s?security=reality&flow=xtls-rprx-vision&type=tcp&sni=%s&pbk=%s&sid=%s&fp=chrome#case%s\n' \
+    "$_c" "$_eid" "$VPS_HOST" "$_ep" "$SNI_HOST" "$REALITY_PUBLIC_KEY" "$SHORT_ID" "$_c"
+}
+
+write_credentials() {
+  _f="/root/xray-deploy/credentials.txt"
+  {
+    echo "== 服务端信息 =="
+    echo "VPS_IP=${VPS_HOST}"
+    echo "REALITY target: ${REALITY_TARGET}  SNI: ${SNIS}"
+    echo "shortId: ${SHORT_ID}"
+    echo "REALITY PublicKey(password): ${REALITY_PUBLIC_KEY}"
+    echo
+    for _c in $CASES; do
+      echo "== 方案${_c} =="
+      echo "  入口端口=$(cat "$WD/c${_c}.entry_port") 入口协议=$(entry_proto_of "$_c")"
+      echo "  隧道端口=$(cat "$WD/c${_c}.bridge_port") 隧道协议=$(bridge_proto_of "$_c")"
+      echo "  入口UUID=$(cat "$WD/c${_c}.entry_id")"
+      echo "  隧道UUID=$(cat "$WD/c${_c}.bridge_id")"
+      echo "  出口设备配置=/root/xray-bridge-case${_c}.jsonc"
+      if [ "$(entry_proto_of "$_c")" = "enc" ]; then
+        echo "  入口设备配置=/root/xray-entry-case${_c}.jsonc"
+      fi
+      echo
+    done
+    if [ "$DIRECT_ENABLED" = "1" ]; then
+      echo "== 中转 VPS 直连节点 =="
+      echo "  端口=${DIRECT_PORT}  入口UUID=$(cat "$WD/direct.uuid")"
+    fi
+  } > "$_f"
+  info "凭据汇总：$_f"
+}
+
+print_summary() {
+  echo
+  info "================ 部署完成 ================"
+  echo "  VPS 地址      : ${VPS_HOST}"
+  echo "  REALITY target: ${REALITY_TARGET}  SNI: ${SNIS}"
+  echo "  shortId       : ${SHORT_ID}"
+  echo
+  for _c in $CASES; do
+    echo "  方案${_c}：入口$(entry_proto_of "$_c")/${VPS_HOST}:$(cat "$WD/c${_c}.entry_port")，隧道$(bridge_proto_of "$_c")/${VPS_HOST}:$(cat "$WD/c${_c}.bridge_port")"
+  done
+  if [ "$DIRECT_ENABLED" = "1" ]; then
+    echo "  直连节点：REALITY/${VPS_HOST}:${DIRECT_PORT}"
+  fi
+  echo
+  echo "  == 客户端（入口设备）=="
+  for _c in $CASES; do
+    if [ "$(entry_proto_of "$_c")" = "reality" ]; then
+      print_case_link "$_c"
+    else
+      printf '    方案%s: 使用 /root/xray-entry-case%s.jsonc（VLESS Encryption）\n' "$_c" "$_c"
+    fi
+  done
+  if [ "$DIRECT_ENABLED" = "1" ]; then
+    printf '    直连: vless://%s@%s:%s?security=reality&flow=xtls-rprx-vision&type=tcp&sni=%s&pbk=%s&sid=%s&fp=chrome#vps-direct\n' \
+      "$(cat "$WD/direct.uuid")" "$VPS_HOST" "$DIRECT_PORT" "$SNI_HOST" "$REALITY_PUBLIC_KEY" "$SHORT_ID"
+  fi
+  echo
+  info "后续步骤："
+  echo "  1) 出口设备导入 /root/xray-bridge-caseN.jsonc 并保持在线（方案2/4 隧道为 REALITY，方案1/3 隧道为 VLESS Encryption）。"
+  echo "  2) 入口设备按上面提示导入分享链接或配置文件。"
+  echo "  3) 详细凭据见 /root/xray-deploy/credentials.txt。"
+}
+
 setup_service() {
   if [ "$INIT" = "openrc" ]; then
     info "创建/更新 OpenRC 服务 /etc/init.d/xray"
@@ -493,136 +686,25 @@ UNIT
   fi
 }
 
-# 防火墙放行（Debian/Ubuntu 的 ufw；Alpine 默认无防火墙）
 setup_firewall() {
   if [ "$INIT" = "openrc" ]; then
-    warn "Alpine 默认未启用防火墙；若使用云厂商安全组，请手动放行 ${REALITY_PORT}/tcp 与 ${BRIDGE_PORT}/tcp。"
+    warn "Alpine 默认未启用防火墙；若使用云厂商安全组，请手动放行所选端口。"
     return 0
   fi
   if command -v ufw >/dev/null 2>&1; then
     if ufw status 2>/dev/null | grep -q "Status: active"; then
-      if confirm "检测到 ufw 已启用，放行 ${REALITY_PORT}/tcp 和 ${BRIDGE_PORT}/tcp？" "Y"; then
-        ufw allow "${REALITY_PORT}/tcp" >/dev/null
-        ufw allow "${BRIDGE_PORT}/tcp" >/dev/null
-        info "ufw 已放行 ${REALITY_PORT}/tcp、${BRIDGE_PORT}/tcp"
+      if confirm "检测到 ufw 已启用，放行脚本使用到的全部端口？" "Y"; then
+        for _p in $ALL_PORTS; do
+          ufw allow "${_p}/tcp" >/dev/null
+        done
+        info "ufw 已放行：$ALL_PORTS"
       fi
     else
-      warn "检测到 ufw 未启用，跳过。若使用云厂商安全组请自行放行端口。"
+      warn "ufw 未启用；若使用云厂商安全组请自行放行端口。"
     fi
   else
-    warn "未检测到 ufw。若使用云厂商安全组/防火墙，请手动放行 ${REALITY_PORT}/tcp 与 ${BRIDGE_PORT}/tcp。"
+    warn "未检测到 ufw；请手动放行云厂商安全组中的相应端口。"
   fi
-}
-
-# 为每个落地设备生成一份客户端配置（主动回连 VPS 建立专属反向隧道）
-write_bridge_clients() {
-  _i=1
-  while [ "$_i" -le "$N_USERS" ]; do
-    _email=$(sed -n "${_i}p" "$WD/emails")
-    _safe=$(printf '%s' "$_email" | tr -c 'A-Za-z0-9._-' '_')
-    _bf="/root/xray-bridge-${_safe}.jsonc"
-    cat > "$_bf" <<EOF
-{
-  // 落地设备配置（${_email}）：设备主动连接 VPS 建立专属反向隧道
-  // 使用方式：v2rayNG 自定义配置导入 / v2rayN 添加自定义配置服务器
-  "log": { "loglevel": "warning" },
-  "inbounds": [],
-  "outbounds": [
-    // 默认直连出站（文档示例保留）
-    { "protocol": "freedom" },
-    {
-      // 承接从 reverse-in 进入的流量，仅放行公网目标（文档示例配置）
-      "protocol": "freedom",
-      "tag": "home-direct",
-      "settings": {
-        "finalRules": [
-          { "action": "allow", "network": "tcp,udp", "ip": ["!geoip:private"] }
-        ]
-      }
-    },
-    {
-      // 主动回连 VPS 建立反向隧道
-      "protocol": "vless",
-      "tag": "to-vps",
-      "settings": {
-        "address": "${VPS_HOST}",
-        "port": ${BRIDGE_PORT},
-        "id": "$(cat "$WD/u${_i}.br")",
-        "encryption": "${ENCRYPTION}",
-        "flow": "xtls-rprx-vision",
-        "reverse": { "tag": "reverse-in-${_i}" }
-      },
-      "streamSettings": { "method": "raw", "security": "none" }
-    }
-  ],
-  "routing": {
-    "domainStrategy": "AsIs",
-    "rules": [
-      { "inboundTag": ["reverse-in-${_i}"], "outboundTag": "home-direct" }
-    ]
-  }
-}
-EOF
-    info "已生成：$_bf（请安全拷贝到用户 $_email 的落地设备导入）"
-    _i=$((_i + 1))
-  done
-}
-
-# 打印分享链接（格式依据官方文档引用的 VLESS 分享链接标准）
-print_links() {
-  echo "  == 分享链接（vless://，依据官方文档引用的分享链接标准）=="
-  _i=1
-  while [ "$_i" -le "$N_USERS" ]; do
-    _email=$(sed -n "${_i}p" "$WD/emails")
-    printf '    %s: vless://%s@%s:%s?security=reality&flow=xtls-rprx-vision&type=tcp&sni=%s&pbk=%s&sid=%s&fp=chrome#%s\n' \
-      "$_email" "$(cat "$WD/u${_i}.ext")" "$VPS_HOST" "$REALITY_PORT" "$SNI_HOST" "$REALITY_PUBLIC_KEY" "$SHORT_ID" "$_email"
-    _i=$((_i + 1))
-  done
-  if [ "$DIRECT_ENABLED" = "1" ]; then
-    printf '    %s（VPS 直连）: vless://%s@%s:%s?security=reality&flow=xtls-rprx-vision&type=tcp&sni=%s&pbk=%s&sid=%s&fp=chrome#%s-direct\n' \
-      "$DIRECT_EMAIL" "$(cat "$WD/direct.uuid")" "$VPS_HOST" "$REALITY_PORT" "$SNI_HOST" "$REALITY_PUBLIC_KEY" "$SHORT_ID" "$DIRECT_EMAIL"
-  fi
-}
-
-# 部署结果汇总
-print_summary() {
-  echo
-  info "================ 部署完成 ================"
-  echo "  VPS 地址      : ${VPS_HOST}"
-  echo "  用户入口端口  : ${REALITY_PORT}  (VLESS + REALITY)"
-  echo "  隧道端口      : ${BRIDGE_PORT}  (VLESS + VLESS Encryption)"
-  echo "  REALITY target: ${REALITY_TARGET}  SNI: ${SNIS}"
-  echo "  shortId       : ${SHORT_ID}"
-  echo
-  echo "  == 用户与落地设备一一对应 =="
-  _i=1
-  while [ "$_i" -le "$N_USERS" ]; do
-    _email=$(sed -n "${_i}p" "$WD/emails")
-    _safe=$(printf '%s' "$_email" | tr -c 'A-Za-z0-9._-' '_')
-    echo "  用户 ${_email}（隧道 #${_i}）"
-    echo "    外部接入 UUID : $(cat "$WD/u${_i}.ext")"
-    echo "    隧道回连 UUID : $(cat "$WD/u${_i}.br")"
-    echo "    落地设备配置 : /root/xray-bridge-${_safe}.jsonc"
-    _i=$((_i + 1))
-  done
-  if [ "$DIRECT_ENABLED" = "1" ]; then
-    echo "  直连节点 ${DIRECT_EMAIL}（出口为中转 VPS）"
-    echo "    外部接入 UUID : $(cat "$WD/direct.uuid")"
-  fi
-  echo
-  if confirm "打印客户端分享链接？" "Y"; then
-    print_links
-  fi
-  echo
-  info "后续步骤："
-  echo "  1) 每台落地设备安装 Xray 客户端并导入对应配置文件，保持在线以建立专属反向隧道。"
-  echo "  2) 各用户导入上面的分享链接，全部流量将经对应落地设备出口。"
-  if [ "$INIT" = "openrc" ]; then
-    echo "  3) 服务管理：rc-service xray restart / rc-service xray status / rc-update add xray"
-  else
-    echo "  3) 服务管理：systemctl restart xray / systemctl status xray"
-  fi
-  echo "  4) 若无法连接，先检查云厂商安全组是否放行 ${REALITY_PORT}/tcp 与 ${BRIDGE_PORT}/tcp。"
 }
 
 main() {
@@ -633,6 +715,7 @@ main() {
   [ "$INIT" != "none" ] || warn "未检测到 systemd/OpenRC，将跳过服务自动配置。"
 
   DIRECT_ENABLED=0
+  ALL_PORTS=""
 
   WD=$(mktemp -d "${TMPDIR:-/tmp}/xray-setup.XXXXXX") || WD="/tmp/xray-setup.$$"
   mkdir -p "$WD"
@@ -657,24 +740,8 @@ main() {
   if [ -z "$_detected_ip" ]; then
     _detected_ip=$(hostname -i 2>/dev/null || true)
   fi
-  VPS_HOST=$(ask "VPS 公网 IP 或域名（用于落地设备配置和分享链接）" "${_detected_ip:-}")
+  VPS_HOST=$(ask "VPS 公网 IP 或域名" "${_detected_ip:-}")
   [ -n "$VPS_HOST" ] || die "VPS 地址不能为空。"
-
-  while :; do
-    REALITY_PORT=$(ask "用户接入端口（VLESS+REALITY）" "443")
-    valid_port "$REALITY_PORT" && break
-    warn "端口无效，请输入 1-65535 之间的数字。"
-  done
-
-  while :; do
-    BRIDGE_PORT=$(ask "反向隧道端口（落地设备回连）" "8443")
-    if ! valid_port "$BRIDGE_PORT"; then
-      warn "端口无效，请输入 1-65535 之间的数字。"
-      continue
-    fi
-    [ "$BRIDGE_PORT" != "$REALITY_PORT" ] && break
-    warn "两个端口不能相同。"
-  done
 
   REALITY_TARGET=$(ask "REALITY 伪装目标 target（格式 域名:端口）" "itunes.apple.com:443")
   case "$REALITY_TARGET" in
@@ -694,32 +761,80 @@ main() {
   done
 
   echo
-  info "请按顺序输入用户 email 列表，第 N 个用户对应第 N 台落地设备："
-  _users_input=$(ask "用户 email（逗号分隔）" "user1,user2")
-  [ -n "$_users_input" ] || die "用户列表不能为空。"
+  info "请选择要部署的方案（可多选，如 1、4、12、1234）："
+  echo "  1) 出口在国外 / 入口在国内（入口 REALITY，隧道 VLESS-enc）"
+  echo "  2) 入口在国外 / 出口在国内（入口 VLESS-enc，隧道 REALITY）"
+  echo "  3) 出入口都在国外（入口 VLESS-enc，隧道 VLESS-enc）"
+  echo "  4) 出入口都在国内（入口 REALITY，隧道 REALITY）"
+  _case_choice=$(ask "方案组合" "4")
+  validate_cases "$_case_choice" || die "无效方案组合：$_case_choice"
+  CASES=""
+  _seen=""
+  _i=0
+  while [ -n "$_case_choice" ]; do
+    _ch=$(printf '%s' "$_case_choice" | cut -c1)
+    _case_choice=$(printf '%s' "$_case_choice" | cut -c2-)
+    case "$_seen" in
+      *"$_ch"*) continue ;;
+    esac
+    _seen="${_seen}${_ch}"
+    _i=$((_i + 1))
+    printf '%s ' "$_ch" >> "$WD/caseorder"
+  done
+  CASES=$(cat "$WD/caseorder" 2>/dev/null | sed 's/ *$//' || printf '')
+  [ -n "$CASES" ] || die "请至少选择一个方案。"
 
-  printf '%s' "$_users_input" | tr ',' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | sed '/^$/d' > "$WD/emails"
-  N_USERS=$(wc -l < "$WD/emails")
-  [ "$N_USERS" -ge 1 ] || die "用户列表不能为空。"
-  _dup=$(sort "$WD/emails" | uniq -d | tr '\n' ' ')
-  [ -z "$_dup" ] || die "用户 email 重复：$_dup"
-  info "共 ${N_USERS} 个用户：$(tr '\n' ',' < "$WD/emails" | sed 's/,$//')"
+  info "已选择方案：$CASES"
 
-  gen_all_uuids
+  # 每个方案生成凭证与端口
+  for _c in $CASES; do
+    echo
+    info "配置方案${_c}："
+    _def_ep=$(default_entry_port "$_c")
+    _def_bp=$(default_bridge_port "$_c")
+    while :; do
+      _ep=$(ask "方案${_c} 入口端口" "$_def_ep")
+      valid_port "$_ep" && break
+      warn "端口无效。"
+    done
+    while :; do
+      _bp=$(ask "方案${_c} 隧道端口" "$_def_bp")
+      valid_port "$_bp" && break
+      warn "端口无效。"
+    done
+    _eemail=$(ask "方案${_c} 用户 email" "user-case${_c}")
+    [ -n "$_eemail" ] || die "email 不能为空。"
+    printf '%s\n' "$_ep" > "$WD/c${_c}.entry_port"
+    printf '%s\n' "$_bp" > "$WD/c${_c}.bridge_port"
+    printf '%s\n' "$_eemail" > "$WD/c${_c}.entry_email"
+    xray uuid > "$WD/c${_c}.entry_id"
+    xray uuid > "$WD/c${_c}.bridge_id"
+    ALL_PORTS="${ALL_PORTS} ${_ep} ${_bp}"
+  done
+
+  # 端口唯一性检查
+  if printf '%s\n' $ALL_PORTS | tr ' ' '\n' | sed '/^$/d' | sort | uniq -d | grep -q .; then
+    die "所选端口存在重复，请重新运行并避免重复端口。"
+  fi
 
   echo
-  if confirm "是否额外添加一个出口为中转 VPS 直连的 VLESS Reality 节点？（SNI 与主入口一致，默认 itunes.apple.com）" "Y"; then
+  if confirm "是否需要额外添加一个出口为中转 VPS 的 VLESS+REALITY 单节点？" "Y"; then
     DIRECT_ENABLED=1
     DIRECT_EMAIL=$(ask "直连节点用户 email" "direct")
-    [ -n "$DIRECT_EMAIL" ] || die "直连节点 email 不能为空。"
-    if grep -qx "$DIRECT_EMAIL" "$WD/emails"; then
-      die "直连节点 email 与落地用户重复：$DIRECT_EMAIL"
-    fi
+    while :; do
+      DIRECT_PORT=$(ask "直连节点端口" "57717")
+      valid_port "$DIRECT_PORT" && break
+      warn "端口无效。"
+    done
+    case " $ALL_PORTS " in
+      *" $DIRECT_PORT "*) die "直连节点端口与方案端口重复：$DIRECT_PORT" ;;
+    esac
+    ALL_PORTS="${ALL_PORTS} ${DIRECT_PORT}"
     xray uuid > "$WD/direct.uuid"
   fi
 
   echo
-  info "VLESS Encryption 认证方式（文档确认二者均可，服务端与客户端必须一致）："
+  info "VLESS Encryption 认证方式（服务端与客户端必须一致）："
   echo "  1) X25519（默认，较短）"
   echo "  2) ML-KEM-768（后量子，较长）"
   _ve_choice=$(ask "选择 [1/2]" "1")
@@ -732,7 +847,7 @@ main() {
   gen_reality_keys
 
   _bak=""
-  mkdir -p /usr/local/etc/xray
+  mkdir -p /usr/local/etc/xray /root/xray-deploy
   if [ -f "$CONF" ]; then
     _bak="${CONF}.bak.$(date +%Y%m%d%H%M%S)"
     if confirm "检测到已有 $CONF，备份后覆盖？" "Y"; then
@@ -754,9 +869,17 @@ main() {
     die "配置校验失败，请根据上面的报错修正后重试。"
   fi
 
+  # 生成客户端产物
+  for _c in $CASES; do
+    write_bridge_client "$_c"
+    if [ "$(entry_proto_of "$_c")" = "enc" ]; then
+      write_entry_enc_client "$_c"
+    fi
+  done
+  write_credentials
+
   setup_service
   setup_firewall
-  write_bridge_clients
   print_summary
 }
 
