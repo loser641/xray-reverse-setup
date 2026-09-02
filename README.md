@@ -314,6 +314,8 @@ rc-update add xray             # 设置开机自启
 rc-service xray checkconfig    # 校验配置
 ```
 
+> 在受限容器/最小化 Alpine 上，如果 `rc-service` 无法保持 Xray 运行，脚本会自动改用 `local.d + nohup` 兜底（root 运行、开机自启、日志在 `/var/log/xray/out.log`），此时手工管理用 `sh /etc/local.d/xray.start` 启动。
+
 常见问题：
 
 | 现象 | 排查方向 |

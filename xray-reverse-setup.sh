@@ -406,30 +406,20 @@ EOF
 # 配置服务并启动（systemd 或 OpenRC）
 setup_service() {
   if [ "$INIT" = "openrc" ]; then
-    if [ -f /etc/init.d/xray ]; then
-      info "使用已存在的 OpenRC 服务 xray"
-    else
-      info "创建 OpenRC 服务 /etc/init.d/xray"
-      cat > /etc/init.d/xray <<'EOF'
+    info "创建/更新 OpenRC 服务 /etc/init.d/xray"
+    cat > /etc/init.d/xray <<'EOF'
 #!/sbin/openrc-run
 
 name="Xray Daemon"
 description="Xray service"
 
-supervisor=supervise-daemon
-respawn_delay=5
-respawn_max=2
-respawn_period=600
-
 pidfile="/run/${RC_SVCNAME}.pid"
-rc_ulimit="-n 1024000 -u 1024000"
-capabilities="^cap_net_bind_service,^cap_net_admin,^cap_net_raw"
+command="/usr/local/bin/xray"
+command_user="root"
+command_args="run -c /usr/local/etc/xray/config.json"
 extra_commands="checkconfig"
 
 env=${env:-"XRAY_LOCATION_ASSET=/usr/local/share/xray/"}
-command="/usr/local/bin/xray"
-command_user="nobody:nobody"
-command_args="run -c /usr/local/etc/xray/config.json"
 required_files="/usr/local/etc/xray/config.json"
 
 depend() {
@@ -448,15 +438,30 @@ start_pre() {
 	checkconfig || return 1
 }
 EOF
-      chmod +x /etc/init.d/xray
-    fi
+    chmod +x /etc/init.d/xray
     rc-update add xray >/dev/null 2>&1 || true
-    rc-service xray restart
+    rc-service xray restart >/dev/null 2>&1 || true
     sleep 2
-    if rc-service xray status >/dev/null 2>&1; then
-      info "Xray 服务运行中"
+    if pgrep -f '/usr/local/bin/xray run' >/dev/null 2>&1; then
+      info "Xray 服务运行中（OpenRC）"
     else
-      warn "Xray 服务状态异常，请查看：rc-service xray status"
+      warn "OpenRC 方式未能保持运行，改用 local.d + nohup（适用受限容器/最小化 Alpine）"
+      mkdir -p /var/log/xray
+      cat > /etc/local.d/xray.start <<'EOF'
+#!/bin/sh
+if ! pgrep -f 'xray run' >/dev/null 2>&1; then
+  nohup env XRAY_LOCATION_ASSET=/usr/local/share/xray/ /usr/local/bin/xray run -c /usr/local/etc/xray/config.json >/var/log/xray/out.log 2>&1 &
+fi
+EOF
+      chmod +x /etc/local.d/xray.start
+      rc-update add local >/dev/null 2>&1 || true
+      sh /etc/local.d/xray.start
+      sleep 2
+      if pgrep -f '/usr/local/bin/xray run' >/dev/null 2>&1; then
+        info "Xray 已通过 local.d 启动（开机自启）"
+      else
+        warn "Xray 仍未运行，请查看 /var/log/xray/out.log"
+      fi
     fi
     return 0
   fi
