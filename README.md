@@ -126,7 +126,7 @@ uuid、REALITY 密钥对、Encryption 密钥、shortId 均在部署时随机生�
 /root/xray-deploy/credentials.txt      全部 UUID / 端口 / 协议汇总
 ```
 
-协议为 REALITY 的入口/出口直接输出 `vless://` 分享链接；VLESS Encryption 无法用分享链接表达，面板和部署结束时会把整份配置（含起止标记）贴出来，直接复制保存即可。出口的 REALITY 链接只用于核对参数，落地设备仍需导入带 `reverse` 的 `xray-bridge-caseN.jsonc`。取消掉的方案会自动删除对应的 `xray-bridge-caseN.jsonc` / `xray-entry-caseN.jsonc`。
+入口为 REALITY（含直连节点）能直接导入，输出 `vless://` 分享链接；出口任何协议都要带 `reverse`，只能以文件导入；VLESS Encryption 无法用分享链接表达，面板和部署结束时会把整份配置（含起止标记）贴出来，直接复制保存即可。出口配置里带 `reverse`，必须原样存成 `xray-bridge-caseN.jsonc` 导入，分享链接表达不了反向隧道。取消掉的方案会自动删除对应的 `xray-bridge-caseN.jsonc` / `xray-entry-caseN.jsonc`。
 
 ## 服务端配置结构
 
@@ -207,5 +207,5 @@ xray run -test -c /usr/local/etc/xray/config.json
 - VLESS 入站用户字段：官方参考文档写 `users`，实测运行时只注册 `clients`；脚本统一使用 `clients`。
 - 多方案共用一个入站：官方路由文档支持按 `user`（即入站用户 email）匹配，脚本据此把同一端口上的不同 UUID 分流到各自的 `reverse-out-N`。
 - “一对一专属隧道”：官方文档有共用 `reverse.tag` 的负载池示例，未直接给出逐用户专属隧道示例；脚本基于文档字段组合实现。
-- VLESS Encryption 的客户端导入没有统一分享链接标准，方案 2/3 的境外入口以 JSON 配置形式提供。
+- VLESS Encryption 的客户端导入没有统一分享链接标准，方案 2/3 的境外入口和所有出口设备都以 JSON 配置形式提供；面板里会贴出整份内容。
 - systemd/OpenRC 单元、ufw 属于系统部署层面，官方文档未规定写法，脚本参照官方安装脚本实现。

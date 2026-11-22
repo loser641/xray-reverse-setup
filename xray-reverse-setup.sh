@@ -45,7 +45,7 @@ export PATH
 
 # 脚本自身地址与版本：lray 用它做离线缓存和“拒绝旧版覆盖”的判断
 SCRIPT_URL="https://github.com/loser641/xray-reverse-setup/raw/main/xray-reverse-setup.sh"
-SCRIPT_REV=4
+SCRIPT_REV=5
 
 CONF="/usr/local/etc/xray/config.json"
 STATE="/usr/local/etc/xray/xray-setup.state"
@@ -1384,14 +1384,9 @@ print_summary() {
   echo
   echo "  == 出口设备（落地，需保持在线）=="
   for _sc in $CASES; do
-    if [ "$(bridge_proto_of "$_sc")" = "reality" ]; then
-      printf '    方案%s 隧道 REALITY 分享链接（端口 %s，仅供核对参数）:\n' "$_sc" "$REALITY_PORT"
-      print_bridge_link "$_sc"
-      printf '    该方案出口必须用含 reverse 的配置文件：%s/xray-bridge-case%s.jsonc\n' "$OUT_DIR" "$_sc"
-    else
-      print_file_block "方案${_sc} 出口配置：隧道 VLESS Encryption，端口 ${ENC_PORT}" \
-        "bridge-case${_sc}.json" "$OUT_DIR/xray-bridge-case${_sc}.jsonc"
-    fi
+    # 出口必须带 reverse，任何协议都只能以配置文件导入
+    print_file_block "方案${_sc} 出口配置：隧道 $(bridge_proto_of "$_sc")，端口 $(bridge_port_of "$_sc")" \
+      "bridge-case${_sc}.json" "$OUT_DIR/xray-bridge-case${_sc}.jsonc"
   done
 
   echo
