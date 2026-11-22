@@ -45,7 +45,7 @@ export PATH
 
 # 脚本自身地址与版本：lray 用它做离线缓存和“拒绝旧版覆盖”的判断
 SCRIPT_URL="https://github.com/loser641/xray-reverse-setup/raw/main/xray-reverse-setup.sh"
-SCRIPT_REV=3
+SCRIPT_REV=4
 
 CONF="/usr/local/etc/xray/config.json"
 STATE="/usr/local/etc/xray/xray-setup.state"
@@ -944,15 +944,33 @@ write_all_clients() {
   done
 }
 
-print_case_link() {
-  _c=$1
-  printf '    方案%s: vless://%s@%s:%s?security=reality&flow=xtls-rprx-vision&type=tcp&sni=%s&pbk=%s&sid=%s&fp=chrome#case%s\n' \
-    "$_c" "$(var "U_ENTRY_$_c")" "$VPS_HOST" "$REALITY_PORT" "$SNI_HOST" "$REALITY_PUBLIC_KEY" "$SHORT_ID" "$_c"
+print_reality_link() { # $1=UUID $2=链接标签
+  printf '    vless://%s@%s:%s?security=reality&flow=xtls-rprx-vision&type=tcp&sni=%s&pbk=%s&sid=%s&fp=chrome#%s\n' \
+    "$1" "$VPS_HOST" "$REALITY_PORT" "$SNI_HOST" "$REALITY_PUBLIC_KEY" "$SHORT_ID" "$2"
+}
+
+print_case_link() { # $1=方案（入口 REALITY）
+  print_reality_link "$(var "U_ENTRY_$1")" "case$1"
+}
+
+print_bridge_link() { # $1=方案（隧道 REALITY）
+  print_reality_link "$(var "U_BRIDGE_$1")" "bridge-case$1"
 }
 
 print_direct_link() {
-  printf '    直连: vless://%s@%s:%s?security=reality&flow=xtls-rprx-vision&type=tcp&sni=%s&pbk=%s&sid=%s&fp=chrome#vps-direct\n' \
-    "$DIRECT_UUID" "$VPS_HOST" "$REALITY_PORT" "$SNI_HOST" "$REALITY_PUBLIC_KEY" "$SHORT_ID"
+  print_reality_link "$DIRECT_UUID" "vps-direct"
+}
+
+# VLESS Encryption 无法用分享链接表达，直接把配置文件整段贴出来方便复制
+print_file_block() { # $1=说明 $2=建议保存的文件名 $3=路径
+  if [ -f "$3" ]; then
+    printf '    %s（复制下面整段，保存为 %s）\n' "$1" "$2"
+    printf '%s\n' "-----BEGIN $2-----"
+    cat "$3"
+    printf '%s\n' "-----END $2-----"
+  else
+    printf '    %s：文件不存在（%s），请回面板选 10 重新应用配置\n' "$1" "$3"
+  fi
 }
 
 write_credentials() {
@@ -1348,24 +1366,32 @@ print_summary() {
   fi
 
   echo
-  echo "  == 客户端（入口设备）=="
+  echo "  == 入口设备（客户端）=="
   for _sc in $CASES; do
     if [ "$(entry_proto_of "$_sc")" = "reality" ]; then
+      printf '    方案%s REALITY 分享链接（导入 v2rayNG / v2rayN）:\n' "$_sc"
       print_case_link "$_sc"
     else
-      printf '    方案%s: 使用 %s/xray-entry-case%s.jsonc（VLESS Encryption）\n' \
-        "$_sc" "$OUT_DIR" "$_sc"
+      print_file_block "方案${_sc} 入口配置：VLESS Encryption，端口 ${ENC_PORT}" \
+        "entry-case${_sc}.json" "$OUT_DIR/xray-entry-case${_sc}.jsonc"
     fi
   done
   if [ "$DIRECT_ENABLED" = "1" ]; then
+    echo "    中继 VPS 直连节点:"
     print_direct_link
   fi
 
   echo
-  echo "  == 出口设备 =="
+  echo "  == 出口设备（落地，需保持在线）=="
   for _sc in $CASES; do
-    printf '    方案%s: %s/xray-bridge-case%s.jsonc（隧道 %s/%s）\n' \
-      "$_sc" "$OUT_DIR" "$_sc" "$(bridge_proto_of "$_sc")" "$(bridge_port_of "$_sc")"
+    if [ "$(bridge_proto_of "$_sc")" = "reality" ]; then
+      printf '    方案%s 隧道 REALITY 分享链接（端口 %s，仅供核对参数）:\n' "$_sc" "$REALITY_PORT"
+      print_bridge_link "$_sc"
+      printf '    该方案出口必须用含 reverse 的配置文件：%s/xray-bridge-case%s.jsonc\n' "$OUT_DIR" "$_sc"
+    else
+      print_file_block "方案${_sc} 出口配置：隧道 VLESS Encryption，端口 ${ENC_PORT}" \
+        "bridge-case${_sc}.json" "$OUT_DIR/xray-bridge-case${_sc}.jsonc"
+    fi
   done
 
   echo
@@ -1727,7 +1753,7 @@ panel_render() {
     warn "有未应用的修改（选 10 应用）"
   fi
   echo
-  echo "   1) 查看凭据 / 分享链接 / 客户端文件"
+  echo "   1) 查看凭据 / 分享链接 / 客户端配置内容"
   echo "   2) 修改 REALITY target / SNI"
   echo "   3) 修改 shortId"
   echo "   4) 修改端口（REALITY / Encryption）"
