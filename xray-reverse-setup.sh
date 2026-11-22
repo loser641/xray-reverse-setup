@@ -1252,7 +1252,9 @@ apply_config() {
     return 1
   fi
 
-  _cfg_tmp="${CONF}.tmp.$$"
+  # 临时文件必须放在配置目录外，且以 .json 结尾（Xray 按扩展名判断格式；
+  # 放在 confdir 里还可能被 `-confdir` 误加载）
+  _cfg_tmp="${WD:-${TMPDIR:-/tmp}}/xray-config-test.$$.json"
   write_server_config_to "$_cfg_tmp" || { rm -f "$_cfg_tmp"; return 1; }
 
   info "校验配置（xray run -test）..."
@@ -1272,11 +1274,12 @@ apply_config() {
     fi
   fi
 
-  if ! mv "$_cfg_tmp" "$CONF"; then
+  if ! cp "$_cfg_tmp" "$CONF"; then
     rm -f "$_cfg_tmp"
     err "写入 $CONF 失败。"
     return 1
   fi
+  rm -f "$_cfg_tmp"
   secure_config || true
   save_state || warn "状态文件写入失败：$STATE"
 
