@@ -94,12 +94,21 @@ sh -c "$(wget -qO- https://github.com/loser641/xray-reverse-setup/raw/main/xray-
 lray              # 打开管理面板
 lray --help       # 查看用法
 lray --install    # 重新部署（会备份旧配置）
+lray --xray       # 安装/切换脚本固定的 Xray 版本（26.7.28）并重启服务
 lray --defaults   # 重新部署时全部取默认值
 ```
 
 面板里可以查看凭据、分享链接和客户端配置内容，并修改 SNI/target、端口、UUID、shortId、REALITY 密钥、VLESS Encryption 密钥、方案组合和直连开关；改完选“应用配置”才会写入、校验并重启。
 
 `lray` 会先拉取仓库里的最新脚本并更新缓存（`/usr/local/share/xray-setup/`），网络失败时直接运行缓存；`LRAY_OFFLINE=1` 可强制离线。非 root 运行会提示 `sudo lray`。若还没有部署状态，`lray` 会提示进入安装流程。
+
+### Xray 版本
+
+脚本默认固定安装 **Xray 26.7.28**。原因：26.9.9 起 REALITY 服务端强制要求 ClientHello 携带 X25519MLKEM768（后量子混合密钥），而 sing-box 1.12+ 会主动删掉它、1.11 及更早则根本不发，结果都是 `reality verification failed`。26.7.28 是最后一个不强制该密钥的版本，同时保留 VLESS Encryption 等功能。
+
+- 已装其它版本时，`lray --xray` 会替换成 26.7.28 并重启服务。
+- 想装最新版：`XRAY_VERSION=latest lray --xray`（会失去 sing-box 兼容）。
+- REALITY 里会写入 `"minClientVer": "1.8.1"`：26.7.11~26.7.28 默认门槛是 26.3.27，而 sing-box 上报的客户端版本是 1.8.1，不放宽会被拒。`MIN_CLIENT_VER` 可覆盖。
 
 ### 交互要点
 
@@ -151,7 +160,7 @@ uuid、REALITY 密钥对、Encryption 密钥、shortId 均在部署时随机生�
 
 ## 客户端部署
 
-> 客户端内核要求：Xray ≥ 25.9（v2rayNG 1.10+、v2rayN 7.x、mihomo 1.19+）。旧内核（1.8.x 等）连接 Xray 26 服务端会报 `REALITY: verification failed` 或 `REALITY: processed invalid connection`，也不认识 `"method": "raw"` 等新字段——先升级客户端再排查网络。
+> 客户端内核：Xray 内核建议 ≥ 25.9（v2rayNG 1.10+、v2rayN 7.x 选 Xray 内核）；sing-box 内核在 26.7.28 服务端上可用（脚本已把 `minClientVer` 放宽到 1.8.1）。注意 sing-box 不支持 Xray 的 VLESS Encryption（`mlkem768x25519plus...`），出口配置和方案 2/3 的入口配置请用 Xray 内核。
 
 ### 出口设备（落地）
 

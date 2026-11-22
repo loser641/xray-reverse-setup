@@ -29,8 +29,12 @@
 #   ./xray-reverse-setup.sh            已部署则打开面板，否则进入安装
 #   ./xray-reverse-setup.sh --panel    打开管理面板
 #   ./xray-reverse-setup.sh --install  重新安装/部署
+#   ./xray-reverse-setup.sh --xray     安装/切换固定版本的 Xray 并重启服务
 #   ./xray-reverse-setup.sh --defaults 安装时全部取默认值（无人值守）
 #   ./xray-reverse-setup.sh --help
+#
+# 版本：Xray 固定 26.7.28（26.9.9+ 的 REALITY 强制后量子混合密钥，
+#       sing-box 会报 reality verification failed）；XRAY_VERSION=latest 可破例。
 #
 # 安全：UUID、REALITY 私钥/公钥、VLESS Encryption 密钥、shortId 全部随机生成，
 #       不内置任何默认凭证；状态文件与控制面板都可随时重新生成。
@@ -45,12 +49,21 @@ export PATH
 
 # 脚本自身地址与版本：lray 用它做离线缓存和“拒绝旧版覆盖”的判断
 SCRIPT_URL="https://github.com/loser641/xray-reverse-setup/raw/main/xray-reverse-setup.sh"
-SCRIPT_REV=7
+SCRIPT_REV=8
 
 CONF="/usr/local/etc/xray/config.json"
 STATE="/usr/local/etc/xray/xray-setup.state"
 DEFAULT_REALITY_PORT=40443
 DEFAULT_ENC_PORT=50443
+
+# 固定 Xray 版本：26.7.28 是最后一个不强制 X25519MLKEM768 的版本。
+# 26.9.9 起 REALITY 服务端要求 ClientHello 带该后量子混合密钥，
+# 而 sing-box（<=1.11 不发、>=1.12 主动删）因此会报 reality verification failed。
+# 需要装最新版时用：XRAY_VERSION=latest ./脚本
+XRAY_VERSION="${XRAY_VERSION:-26.7.28}"
+# REALITY 服务端允许的最低客户端版本。26.7.11~26.7.28 默认 26.3.27，
+# 而 sing-box 在 ClientHello 里上报 1.8.1，会被默认门槛拒掉；这里显式放宽。
+MIN_CLIENT_VER="${MIN_CLIENT_VER:-1.8.1}"
 
 # ---------------------------------------------------------------- 输出与颜色
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
@@ -396,18 +409,67 @@ LRAY
 }
 
 # ---------------------------------------------------------------- 安装 Xray
+xray_installed_version() {
+  command -v xray >/dev/null 2>&1 || return 1
+  xray version 2>/dev/null | sed -n '1s/^Xray \([0-9][0-9.]*\).*/\1/p'
+}
+
+xray_download_url() { # $1=zip 文件名
+  if [ "$XRAY_VERSION" = "latest" ]; then
+    printf 'https://github.com/XTLS/Xray-core/releases/latest/download/%s' "$1"
+  else
+    printf 'https://github.com/XTLS/Xray-core/releases/download/v%s/%s' "$XRAY_VERSION" "$1"
+  fi
+}
+
+install_xray_zip() {
+  _zip=$(detect_arch)
+  info "下载 Xray ${XRAY_VERSION}（${_zip}）..."
+  download "$(xray_download_url "$_zip")" "$WD/${_zip}" \
+    || die "下载 ${_zip} 失败，请检查网络后重试。"
+  (
+    cd "$WD"
+    unzip_file "$_zip" >/dev/null
+    [ -f xray ] || die "压缩包内未找到 xray 可执行文件。"
+    install -m 755 xray /usr/local/bin/xray
+    mkdir -p /usr/local/share/xray
+    [ -f geoip.dat ]  && install -m 644 geoip.dat  /usr/local/share/xray/ || true
+    [ -f geosite.dat ] && install -m 644 geosite.dat /usr/local/share/xray/ || true
+  )
+}
+
 install_xray() {
-  if command -v xray >/dev/null 2>&1; then
-    if xray vlessenc >/dev/null 2>&1; then
+  _cur=$(xray_installed_version || true)
+
+  if [ -n "$_cur" ]; then
+    if [ "$XRAY_VERSION" != "latest" ] && [ "$_cur" = "$XRAY_VERSION" ]; then
+      if xray vlessenc >/dev/null 2>&1; then
+        info "检测到已安装 Xray ${_cur}（脚本固定版本），跳过安装。"
+        return 0
+      fi
+      warn "Xray ${_cur} 缺少 vlessenc 命令，需要重装。"
+    elif [ "$XRAY_VERSION" = "latest" ] && xray vlessenc >/dev/null 2>&1; then
       info "检测到已安装 Xray：$(xray version | head -n 1)"
       if confirm "直接使用现有 Xray（跳过安装）？" "Y"; then
         return 0
       fi
+    elif [ "$XRAY_VERSION" != "latest" ]; then
+      warn "当前 Xray ${_cur}，脚本固定使用 ${XRAY_VERSION}："
+      warn "  >= 26.9.9 的 REALITY 会拒绝 sing-box（强制 X25519MLKEM768）。"
+      confirm "替换为 Xray ${XRAY_VERSION}？" "Y" || return 0
     else
       warn "检测到 Xray，但缺少 vlessenc 命令（版本过旧，需 >= v24.11）。"
       confirm "继续安装/升级到最新版？" "Y" \
         || die "需要新版 Xray（含 VLESS Encryption）才能继续。"
     fi
+  fi
+
+  if [ "$XRAY_VERSION" != "latest" ]; then
+    install_xray_zip
+    command -v xray >/dev/null 2>&1 || die "xray 不可用，安装失败。"
+    xray vlessenc >/dev/null 2>&1 || die "Xray ${XRAY_VERSION} 缺少 vlessenc，无法继续。"
+    info "Xray 版本：$(xray version | head -n 1)"
+    return 0
   fi
 
   echo
@@ -436,19 +498,7 @@ install_xray() {
       fi
       ;;
     2)
-      _zip=$(detect_arch)
-      info "下载 ${_zip} ..."
-      download "https://github.com/XTLS/Xray-core/releases/latest/download/${_zip}" \
-        "$WD/${_zip}" || die "下载 ${_zip} 失败，请检查网络后重试。"
-      (
-        cd "$WD"
-        unzip_file "$_zip" >/dev/null
-        [ -f xray ] || die "压缩包内未找到 xray 可执行文件。"
-        install -m 755 xray /usr/local/bin/xray
-        mkdir -p /usr/local/share/xray
-        [ -f geoip.dat ]  && install -m 644 geoip.dat  /usr/local/share/xray/ || true
-        [ -f geosite.dat ] && install -m 644 geosite.dat /usr/local/share/xray/ || true
-      )
+      install_xray_zip
       ;;
     3)
       info "跳过安装，请自行确保 xray 可用且支持 vlessenc 命令。"
@@ -683,7 +733,8 @@ reality_stream_block() {
   printf '          "target": "%s",\n' "$REALITY_TARGET"
   printf '          "serverNames": [%s],\n' "$(json_str_array "$SNIS")"
   printf '          "privateKey": "%s",\n' "$REALITY_PRIVATE_KEY"
-  printf '          "shortIds": ["%s"]\n' "$SHORT_ID"
+  printf '          "shortIds": ["%s"],\n' "$SHORT_ID"
+  printf '          "minClientVer": "%s"\n' "$MIN_CLIENT_VER"
   printf '        }\n'
 }
 
@@ -1812,6 +1863,7 @@ Xray VLESS 反向代理（多场景一对一落地）中转 VPS 部署 / 管理�
   ./xray-reverse-setup.sh             已部署则打开面板，否则安装
   ./xray-reverse-setup.sh --panel     打开管理面板
   ./xray-reverse-setup.sh --install   重新安装/部署
+  ./xray-reverse-setup.sh --xray      安装/切换脚本固定的 Xray 版本并重启服务
   ./xray-reverse-setup.sh --defaults  安装时全部取默认值（无人值守）
   ./xray-reverse-setup.sh --help      显示本帮助
 
@@ -1822,10 +1874,17 @@ Xray VLESS 反向代理（多场景一对一落地）中转 VPS 部署 / 管理�
 同一协议的方案共用一个入站/端口，通过不同 UUID（用户）区分，
 路由按用户邮箱 entry-caseN -> reverse-out-N。
 
+Xray 版本：
+  默认固定 26.7.28（最后一个不强制 X25519MLKEM768 的版本，兼容 sing-box）。
+  26.9.9 起 REALITY 服务端要求后量子混合密钥，sing-box 会验证失败。
+  XRAY_VERSION=latest 可改为安装最新版。
+
 环境变量：
   NO_COLOR=1              关闭彩色输出
   XRAY_SETUP_NO_TTY=1     不读取 /dev/tty，仅从 stdin 取输入（CI 用）
   XRAY_SETUP_OUT_DIR=DIR  客户端配置/凭据输出目录（默认 /root）
+  XRAY_VERSION=26.7.28    固定安装的 Xray 版本；latest=最新版
+  MIN_CLIENT_VER=1.8.1    REALITY 服务端接受的最低客户端版本（sing-box 上报 1.8.1）
 EOF
 }
 
@@ -1837,6 +1896,7 @@ parse_args() {
       -y|--yes|--defaults) ASSUME_DEFAULTS=1; MODE=install ;;
       --install) MODE=install ;;
       --panel)   MODE=panel ;;
+      --xray)    MODE=xray ;;
       -h|--help) usage; exit 0 ;;
       *) usage >&2; die "未知参数：$_arg" ;;
     esac
@@ -1867,6 +1927,14 @@ main() {
   case "$MODE" in
     install) run_install ;;
     panel)   panel_main ;;
+    xray)
+      install_xray
+      if [ -f "$CONF" ]; then
+        setup_service
+      else
+        warn "未找到 $CONF，未重启服务；请先完成部署（--install）。"
+      fi
+      ;;
     auto)
       if state_ready; then
         panel_main
