@@ -50,6 +50,7 @@ flowchart LR
 - 可选“出口为中转 VPS 的 VLESS+REALITY 单节点”
 - 写入配置前自动备份，写入后 `xray run -test` 校验，失败自动还原
 - 自动创建 systemd/OpenRC 服务（受限容器自动回退 `local.d + nohup`）并放行 ufw 端口
+- 安装 `lray` 快捷命令，随时重新唤起脚本（自动取最新版，离线回退本地缓存）
 
 ## 快速开始
 
@@ -76,6 +77,18 @@ sh -c "$(wget -qO- https://github.com/loser641/xray-reverse-setup/raw/main/xray-
 ```
 
 也可以先下载再执行：`wget -O xr.sh <脚本链接> && sh xr.sh`。
+
+### 快捷命令 lray
+
+每次运行本脚本时都会安装/更新 `/usr/local/bin/lray`。之后在 root shell 里直接输入：
+
+```bash
+lray              # 重新唤起交互脚本
+lray --help       # 查看用法
+lray --defaults   # 全部取默认值
+```
+
+`lray` 会先拉取仓库里的最新脚本并更新缓存（`/usr/local/share/xray-setup/`），网络失败时直接运行缓存；`LRAY_OFFLINE=1` 可强制离线。非 root 运行会提示 `sudo lray`。
 
 ### 交互要点
 

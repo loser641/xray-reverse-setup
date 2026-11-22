@@ -22,6 +22,8 @@
 #     ./xray-reverse-setup.sh              # 交互式部署
 #     ./xray-reverse-setup.sh --defaults   # 所有提问使用默认值（预演/自动化）
 #     ./xray-reverse-setup.sh --help
+#   部署完成后会安装快捷命令 lray，直接输入 lray 即可重新唤起（自动取最新版，
+#   失败时用本地缓存）。
 #
 # 说明：交互提示一律写到终端（stdout 只用于返回值），因此本脚本既能直接
 #       运行，也能在 `sh -c "$(curl ...)"` / `curl ... | sh` 这类场景下工作。
@@ -33,6 +35,9 @@ umask 022
 # 受限环境（cron、非登录 shell）常常没有 sbin，这里固定一份可用的 PATH
 PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
 export PATH
+
+# 脚本自身地址：lray 快捷命令、离线缓存都会用到
+SCRIPT_URL="https://github.com/loser641/xray-reverse-setup/raw/main/xray-reverse-setup.sh"
 
 # ---------------------------------------------------------------- 输出与颜色
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
@@ -220,7 +225,12 @@ http_get() {
 download() {
   rm -f "$2"
   if command -v wget >/dev/null 2>&1; then
-    wget -q -T 30 --tries=2 -O "$2" "$1" || { rm -f "$2"; return 1; }
+    # BusyBox wget 没有 --tries，先探测再决定参数
+    if wget --help 2>&1 | grep -q -- '--tries'; then
+      wget -q -T 30 --tries=2 -O "$2" "$1" || { rm -f "$2"; return 1; }
+    else
+      wget -q -T 30 -O "$2" "$1" || { rm -f "$2"; return 1; }
+    fi
   elif command -v curl >/dev/null 2>&1; then
     curl -fsSL --connect-timeout 15 --retry 2 -o "$2" "$1" || { rm -f "$2"; return 1; }
   else
@@ -246,6 +256,84 @@ unzip_file() { # $1=zip 文件；解压到当前目录
   else
     die "未找到 unzip 且无法自动安装，请先安装 unzip 后重试。"
   fi
+}
+
+# ---------------------------------------------------------------- lray 快捷命令
+# 安装 /usr/local/bin/lray：输入 lray 即可重新唤起本脚本。
+# 每次先尝试拉最新版并更新缓存，失败时用本地缓存；首次缓存由本次部署写入。
+install_lray() {
+  _lray_bin=/usr/local/bin
+  _lray_dir=/usr/local/share/xray-setup
+  _lray_cache="$_lray_dir/xray-reverse-setup.sh"
+
+  if ! mkdir -p "$_lray_bin" "$_lray_dir" 2>/dev/null; then
+    warn "无法创建 lray 安装目录，跳过快捷命令安装。"
+    return 0
+  fi
+
+  # 首次缓存：从文件运行就直接复制当前脚本；管道方式运行则重新拉一份
+  if [ -f "$0" ] && [ -r "$0" ] && head -n 1 "$0" 2>/dev/null | grep -q '^#!/bin/sh'; then
+    case "$0" in
+      */*) grep -q 'xray-reverse-setup' "$0" 2>/dev/null && cp "$0" "$_lray_cache" 2>/dev/null || true ;;
+    esac
+  fi
+  if [ ! -s "$_lray_cache" ]; then
+    if download "$SCRIPT_URL" "${_lray_cache}.tmp" 2>/dev/null; then
+      mv "${_lray_cache}.tmp" "$_lray_cache"
+    else
+      rm -f "${_lray_cache}.tmp"
+    fi
+  fi
+
+  sed "s|@SCRIPT_URL@|$SCRIPT_URL|" > "$_lray_bin/lray" <<'LRAY'
+#!/bin/sh
+# lray — 重新唤起 Xray 反向代理部署脚本（由 xray-reverse-setup.sh 安装）
+# 先取最新版并更新缓存，失败时用本地缓存；LRAY_OFFLINE=1 可强制离线。
+set -u
+
+URL=${LRAY_URL:-@SCRIPT_URL@}
+CACHE=${LRAY_CACHE:-/usr/local/share/xray-setup/xray-reverse-setup.sh}
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "[x] 请用 root 运行：sudo lray" >&2
+  exit 1
+fi
+
+mkdir -p "${CACHE%/*}" 2>/dev/null || true
+
+_tmp="${CACHE}.new.$$"
+_ok=1
+if [ -z "${LRAY_OFFLINE:-}" ]; then
+  if command -v wget >/dev/null 2>&1; then
+    if wget --help 2>&1 | grep -q -- '--tries'; then
+      wget -q -T 30 --tries=1 -O "$_tmp" "$URL" && _ok=0
+    else
+      wget -q -T 30 -O "$_tmp" "$URL" && _ok=0
+    fi
+  elif command -v curl >/dev/null 2>&1; then
+    curl -fsSL --connect-timeout 15 --retry 2 -o "$_tmp" "$URL" && _ok=0
+  fi
+fi
+
+if [ "$_ok" -eq 0 ] && head -n 1 "$_tmp" 2>/dev/null | grep -q '^#!/bin/sh'; then
+  mv "$_tmp" "$CACHE"
+else
+  rm -f "$_tmp"
+  if [ -f "$CACHE" ]; then
+    if [ -z "${LRAY_OFFLINE:-}" ]; then
+      echo "[!] 获取最新脚本失败，改用本地缓存：$CACHE" >&2
+    fi
+  else
+    echo "[x] 获取脚本失败，且本地没有缓存。" >&2
+    exit 1
+  fi
+fi
+
+exec sh "$CACHE" "$@"
+LRAY
+
+  chmod 755 "$_lray_bin/lray"
+  info "已安装快捷命令 lray（重新唤起：lray；帮助：lray --help）"
 }
 
 # ---------------------------------------------------------------- 安装 Xray
@@ -958,6 +1046,7 @@ Xray VLESS 反向代理（多场景一对一落地）中转 VPS 部署脚本
   ./xray-reverse-setup.sh             交互式部署（推荐）
   ./xray-reverse-setup.sh --defaults  所有提问取默认值（预演/无人值守）
   ./xray-reverse-setup.sh --help      显示本帮助
+  lray                                部署后安装的快捷命令，重新唤起本脚本
 
 环境变量：
   NO_COLOR=1              关闭彩色输出
@@ -992,6 +1081,8 @@ main() {
   INIT=$(detect_init)
   info "初始化系统：${INIT}"
   [ "$INIT" != "none" ] || warn "未检测到 systemd/OpenRC，将跳过服务自动配置。"
+
+  install_lray
 
   DIRECT_ENABLED=0
   ALL_PORTS=''
