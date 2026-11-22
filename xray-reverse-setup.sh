@@ -274,7 +274,8 @@ install_lray() {
   # 首次缓存：从文件运行就直接复制当前脚本；管道方式运行则重新拉一份
   if [ -f "$0" ] && [ -r "$0" ] && head -n 1 "$0" 2>/dev/null | grep -q '^#!/bin/sh'; then
     case "$0" in
-      */*) grep -q 'xray-reverse-setup' "$0" 2>/dev/null && cp "$0" "$_lray_cache" 2>/dev/null || true ;;
+      */*) grep -q 'xray-reverse-setup' "$0" 2>/dev/null && [ "$0" != "$_lray_cache" ] \
+             && cp "$0" "$_lray_cache" 2>/dev/null || true ;;
     esac
   fi
   if [ ! -s "$_lray_cache" ]; then
