@@ -1,32 +1,39 @@
 #!/bin/sh
 # =============================================================================
-# Xray VLESS 反向代理（多场景一对一落地）中转 VPS 交互式部署脚本
+# Xray VLESS 反向代理（多场景一对一落地）中转 VPS 部署 / 管理脚本
 #
 # 适用系统：Alpine Linux（OpenRC）/ Debian / Ubuntu（systemd）
 # 依赖：仅系统自带工具（sh、wget 或 curl、sed、awk、tr、grep），不安装 bash；
 #       unzip 只在“手动下载安装”时使用，缺失时会尝试自动安装。
 # 需要 root 运行。
 #
-# 四种场景（按“设备相对 GFW 的位置”理解，可一次多选，如 12 / 1,3 / 1234）：
+# 设计：
+#   入站按协议合并，不再每个方案各占一个端口：
+#     - REALITY 入站（默认 40443）：方案 1/4 的入口 + 方案 2/4 的隧道 + 直连节点
+#     - VLESS Encryption 入站（默认 50443）：方案 2/3 的入口 + 方案 1/3 的隧道
+#   每个方案仍然有独立的入口/隧道 UUID（作为同一入站里的不同用户），
+#   路由按用户邮箱区分：entry-caseN -> reverse-out-N。
+#
+# 四种场景（按“设备相对 GFW 的位置”理解，可多选，如 12 / 1,4 / 1234）：
 #   方案1：出口在国外，入口在国内 -> 入口 REALITY，隧道 VLESS Encryption
 #   方案2：入口在国外，出口在国内 -> 入口 VLESS Encryption，隧道 REALITY
 #   方案3：出入口都在国外       -> 两端都是 VLESS Encryption
 #   方案4：出入口都在国内       -> 两端都是 VLESS+REALITY
 #   原则：哪一端在国内，那一端就套 REALITY 伪装；国外端用 VLESS Encryption。
-#   可选：额外加一个“出口为本中转 VPS”的 VLESS+REALITY 单节点。
 #
 # 用法：
-#   一条命令（root，脚本直接从终端读取输入，无需先落盘）：
+#   一条命令安装（root，脚本直接从终端读取输入，无需先落盘）：
 #     sh -c "$(wget -qO- https://github.com/loser641/xray-reverse-setup/raw/main/xray-reverse-setup.sh)"
-#   已下载到本地时：
-#     ./xray-reverse-setup.sh              # 交互式部署
-#     ./xray-reverse-setup.sh --defaults   # 所有提问使用默认值（预演/自动化）
-#     ./xray-reverse-setup.sh --help
-#   部署完成后会安装快捷命令 lray，直接输入 lray 即可重新唤起（自动取最新版，
-#   失败时用本地缓存）。
+#   安装后输入 lray 打开管理面板（改 SNI/端口/UUID/密钥、查看凭据）。
 #
-# 说明：交互提示一律写到终端（stdout 只用于返回值），因此本脚本既能直接
-#       运行，也能在 `sh -c "$(curl ...)"` / `curl ... | sh` 这类场景下工作。
+#   ./xray-reverse-setup.sh            已部署则打开面板，否则进入安装
+#   ./xray-reverse-setup.sh --panel    打开管理面板
+#   ./xray-reverse-setup.sh --install  重新安装/部署
+#   ./xray-reverse-setup.sh --defaults 安装时全部取默认值（无人值守）
+#   ./xray-reverse-setup.sh --help
+#
+# 安全：UUID、REALITY 私钥/公钥、VLESS Encryption 密钥、shortId 全部随机生成，
+#       不内置任何默认凭证；状态文件与控制面板都可随时重新生成。
 # =============================================================================
 
 set -eu
@@ -38,6 +45,11 @@ export PATH
 
 # 脚本自身地址：lray 快捷命令、离线缓存都会用到
 SCRIPT_URL="https://github.com/loser641/xray-reverse-setup/raw/main/xray-reverse-setup.sh"
+
+CONF="/usr/local/etc/xray/config.json"
+STATE="/usr/local/etc/xray/xray-setup.state"
+DEFAULT_REALITY_PORT=40443
+DEFAULT_ENC_PORT=50443
 
 # ---------------------------------------------------------------- 输出与颜色
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
@@ -160,8 +172,19 @@ valid_short_id() {
   [ $(( ${#1} % 2 )) -eq 0 ] && [ "${#1}" -le 16 ]
 }
 
-# 方案组合只允许 1-4 的数字（允许 1,2 / 1 2 / 1，2 这类写法，由 normalize_cases 预处理）
-validate_cases() {
+valid_uuid() {
+  case "$1" in
+    ????????-????-????-????-????????????|????????????????????????????????) : ;;
+    *) return 1 ;;
+  esac
+  case "$1" in
+    *[!0-9a-fA-F-]*) return 1 ;;
+  esac
+  _uuid_hex=$(printf '%s' "$1" | tr -d '-')
+  [ "${#_uuid_hex}" -eq 32 ]
+}
+
+valid_cases() {
   case "$1" in
     ''|*[!1-4]*) return 1 ;;
   esac
@@ -170,6 +193,26 @@ validate_cases() {
 
 normalize_cases() {
   printf '%s' "$1" | tr -d ' \t,，、;；'
+}
+
+# 把 CASES 整理成去重、空格分隔的 "1 2 3 4" 形式；空或非法返回非 0
+normalize_cases_var() {
+  _nc_raw=$(normalize_cases "$CASES")
+  valid_cases "$_nc_raw" || return 1
+  _nc_out=''
+  _nc_seen=''
+  _nc_rest=$_nc_raw
+  while [ -n "$_nc_rest" ]; do
+    _nc_ch=${_nc_rest%"${_nc_rest#?}"}
+    _nc_rest=${_nc_rest#?}
+    case " $_nc_seen " in
+      *" $_nc_ch "*) continue ;;
+    esac
+    _nc_seen="$_nc_seen $_nc_ch"
+    _nc_out="${_nc_out:+$_nc_out }${_nc_ch}"
+  done
+  CASES=$_nc_out
+  [ -n "$CASES" ]
 }
 
 # ---------------------------------------------------------------- 环境探测
@@ -259,8 +302,7 @@ unzip_file() { # $1=zip 文件；解压到当前目录
 }
 
 # ---------------------------------------------------------------- lray 快捷命令
-# 安装 /usr/local/bin/lray：输入 lray 即可重新唤起本脚本。
-# 每次先尝试拉最新版并更新缓存，失败时用本地缓存；首次缓存由本次部署写入。
+# 安装 /usr/local/bin/lray：输入 lray 即打开管理面板（无状态时提示安装）。
 install_lray() {
   _lray_bin=/usr/local/bin
   _lray_dir=/usr/local/share/xray-setup
@@ -288,8 +330,8 @@ install_lray() {
 
   sed "s|@SCRIPT_URL@|$SCRIPT_URL|" > "$_lray_bin/lray" <<'LRAY'
 #!/bin/sh
-# lray — 重新唤起 Xray 反向代理部署脚本（由 xray-reverse-setup.sh 安装）
-# 先取最新版并更新缓存，失败时用本地缓存；LRAY_OFFLINE=1 可强制离线。
+# lray — 打开 Xray 反向代理管理面板（由 xray-reverse-setup.sh 安装）
+# 先取最新版脚本并更新缓存，失败时用本地缓存；LRAY_OFFLINE=1 可强制离线。
 set -u
 
 URL=${LRAY_URL:-@SCRIPT_URL@}
@@ -330,11 +372,12 @@ else
   fi
 fi
 
+[ "$#" -gt 0 ] || set -- --panel
 exec sh "$CACHE" "$@"
 LRAY
 
   chmod 755 "$_lray_bin/lray"
-  info "已安装快捷命令 lray（重新唤起：lray；帮助：lray --help）"
+  info "已安装快捷命令 lray（打开管理面板：lray）"
 }
 
 # ---------------------------------------------------------------- 安装 Xray
@@ -421,6 +464,7 @@ gen_reality_keys() {
 # $1=x25519|mlkem；vlessenc 会依次输出两对（先 X25519，后 ML-KEM-768）
 gen_vlessenc() {
   _ve_auth=$1
+  ENC_AUTH=$_ve_auth
   _ve_n=1
   [ "$_ve_auth" = "mlkem" ] && _ve_n=2
 
@@ -435,8 +479,167 @@ gen_vlessenc() {
   [ -n "$DECRYPTION" ] && [ -n "$ENCRYPTION" ] || die "解析 vlessenc 输出失败。"
 }
 
+gen_short_id() {
+  xray uuid | tr -d '-' | cut -c1-8
+}
+
+enc_auth_of() {
+  if [ "${#DECRYPTION}" -gt 100 ]; then
+    echo "mlkem"
+  else
+    echo "x25519"
+  fi
+}
+
+# ---------------------------------------------------------------- 方案与协议
+entry_proto_of() {
+  case "$1" in
+    1|4) echo "reality" ;;
+    *)   echo "enc" ;;
+  esac
+}
+
+bridge_proto_of() {
+  case "$1" in
+    2|4) echo "reality" ;;
+    *)   echo "enc" ;;
+  esac
+}
+
+entry_inbound_of() {
+  if [ "$(entry_proto_of "$1")" = "reality" ]; then
+    echo "in-reality"
+  else
+    echo "in-enc"
+  fi
+}
+
+bridge_port_of() {
+  if [ "$(bridge_proto_of "$1")" = "reality" ]; then
+    printf '%s' "$REALITY_PORT"
+  else
+    printf '%s' "$ENC_PORT"
+  fi
+}
+
+need_reality() {
+  [ "$DIRECT_ENABLED" = "1" ] && return 0
+  for _nc in $CASES; do
+    case "$_nc" in
+      1|2|4) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+need_enc() {
+  for _nc in $CASES; do
+    case "$_nc" in
+      1|2|3) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+var() { eval "printf '%s' \"\${$1-}\""; }
+setvar() { eval "$1=\$2"; }
+
+# ---------------------------------------------------------------- 状态
+state_ready() {
+  [ -f "$STATE" ] && grep -q "^STATE_VERSION='2'$" "$STATE" 2>/dev/null
+}
+
+init_state_defaults() {
+  STATE_VERSION=2
+  VPS_HOST=''
+  REALITY_TARGET="itunes.apple.com:443"
+  SNI_HOST="itunes.apple.com"
+  SNIS="itunes.apple.com"
+  SHORT_ID=''
+  REALITY_PRIVATE_KEY=''
+  REALITY_PUBLIC_KEY=''
+  REALITY_PORT=$DEFAULT_REALITY_PORT
+  ENC_PORT=$DEFAULT_ENC_PORT
+  DECRYPTION=''
+  ENCRYPTION=''
+  ENC_AUTH=''
+  CASES=''
+  DIRECT_ENABLED=0
+  DIRECT_UUID=''
+  U_ENTRY_1=''; U_ENTRY_2=''; U_ENTRY_3=''; U_ENTRY_4=''
+  U_BRIDGE_1=''; U_BRIDGE_2=''; U_BRIDGE_3=''; U_BRIDGE_4=''
+}
+
+load_state() {
+  init_state_defaults
+  [ -f "$STATE" ] || return 1
+  # shellcheck disable=SC1090
+  . "$STATE" 2>/dev/null || true
+  if [ "${STATE_VERSION:-0}" != "2" ]; then
+    warn "状态文件版本不兼容：$STATE（请重新运行安装）"
+    init_state_defaults
+    return 1
+  fi
+  normalize_cases_var || true
+  return 0
+}
+
+save_state() {
+  _ss_dir=${STATE%/*}
+  mkdir -p "$_ss_dir" 2>/dev/null || true
+  _ss_tmp="${STATE}.tmp.$$"
+  {
+    printf '%s\n' '# 由 xray-reverse-setup.sh 生成；lray 管理面板读取此文件'
+    printf "STATE_VERSION='%s'\n" 2
+    printf "VPS_HOST='%s'\n" "$VPS_HOST"
+    printf "REALITY_TARGET='%s'\n" "$REALITY_TARGET"
+    printf "SNI_HOST='%s'\n" "$SNI_HOST"
+    printf "SNIS='%s'\n" "$SNIS"
+    printf "SHORT_ID='%s'\n" "$SHORT_ID"
+    printf "REALITY_PRIVATE_KEY='%s'\n" "$REALITY_PRIVATE_KEY"
+    printf "REALITY_PUBLIC_KEY='%s'\n" "$REALITY_PUBLIC_KEY"
+    printf "REALITY_PORT='%s'\n" "$REALITY_PORT"
+    printf "ENC_PORT='%s'\n" "$ENC_PORT"
+    printf "DECRYPTION='%s'\n" "$DECRYPTION"
+    printf "ENCRYPTION='%s'\n" "$ENCRYPTION"
+    printf "ENC_AUTH='%s'\n" "$ENC_AUTH"
+    printf "CASES='%s'\n" "$CASES"
+    printf "DIRECT_ENABLED='%s'\n" "$DIRECT_ENABLED"
+    printf "DIRECT_UUID='%s'\n" "$DIRECT_UUID"
+    for _c in 1 2 3 4; do
+      printf "U_ENTRY_%s='%s'\n" "$_c" "$(var "U_ENTRY_$_c")"
+      printf "U_BRIDGE_%s='%s'\n" "$_c" "$(var "U_BRIDGE_$_c")"
+    done
+  } > "$_ss_tmp"
+  chmod 600 "$_ss_tmp"
+  mv "$_ss_tmp" "$STATE"
+}
+
+ensure_uuids() {
+  for _c in 1 2 3 4; do
+    [ -n "$(var "U_ENTRY_$_c")" ] || setvar "U_ENTRY_$_c" "$(xray uuid)"
+    [ -n "$(var "U_BRIDGE_$_c")" ] || setvar "U_BRIDGE_$_c" "$(xray uuid)"
+  done
+  [ -n "$DIRECT_UUID" ] || DIRECT_UUID=$(xray uuid)
+}
+
+ensure_credentials() {
+  ensure_uuids
+  [ -n "$SHORT_ID" ] || SHORT_ID=$(gen_short_id)
+  if need_reality; then
+    if [ -z "$REALITY_PRIVATE_KEY" ] || [ -z "$REALITY_PUBLIC_KEY" ]; then
+      gen_reality_keys
+    fi
+  fi
+  if need_enc; then
+    if [ -z "$DECRYPTION" ] || [ -z "$ENCRYPTION" ]; then
+      gen_vlessenc "${ENC_AUTH:-x25519}"
+    fi
+    ENC_AUTH=${ENC_AUTH:-$(enc_auth_of)}
+  fi
+}
+
 # ---------------------------------------------------------------- JSON 片段
-# 逗号分隔列表 -> JSON 字符串数组，如 "a.com,b.com" -> "a.com", "b.com"
 json_str_array() {
   _js_list=$1
   _js_out=''
@@ -458,39 +661,6 @@ json_str_array() {
   printf '%s' "$_js_out"
 }
 
-# 方案 -> 入口 / 隧道协议
-entry_proto_of() {
-  case "$1" in
-    1|4) echo "reality" ;;
-    *)   echo "enc" ;;
-  esac
-}
-
-bridge_proto_of() {
-  case "$1" in
-    2|4) echo "reality" ;;
-    *)   echo "enc" ;;
-  esac
-}
-
-default_entry_port() {
-  case "$1" in
-    1) echo 40143 ;;
-    2) echo 40243 ;;
-    3) echo 40343 ;;
-    4) echo 40443 ;;
-  esac
-}
-
-default_bridge_port() {
-  case "$1" in
-    1) echo 50143 ;;
-    2) echo 50243 ;;
-    3) echo 50343 ;;
-    4) echo 50443 ;;
-  esac
-}
-
 reality_stream_block() {
   printf '        "method": "raw",\n'
   printf '        "security": "reality",\n'
@@ -507,127 +677,131 @@ enc_stream_block() {
   printf '        "security": "none"\n'
 }
 
-# 单个 VLESS 入站：$1=tag $2=port $3=proto $4=id $5=email $6=reverse-tag $7=注释
-emit_inbound() {
-  _tag=$1
-  _port=$2
-  _proto=$3
-  _id=$4
-  _email=$5
-  _rev=$6
-  _note=$7
+# 输出一行 client；$1=id $2=email $3=reverse tag（可空）
+emit_client_line() {
+  if [ "$_cl_n" -gt 0 ]; then
+    printf ',\n'
+  fi
+  _cl_n=$((_cl_n + 1))
+  if [ -n "${3-}" ]; then
+    printf '          { "id": "%s", "email": "%s", "flow": "xtls-rprx-vision", "reverse": { "tag": "%s" } }' \
+      "$1" "$2" "$3"
+  else
+    printf '          { "id": "%s", "email": "%s", "flow": "xtls-rprx-vision" }' "$1" "$2"
+  fi
+}
 
+# $1=reality|enc：按协议输出该入站的全部用户
+emit_clients_for() {
+  _cl_n=0
+  for _ec in $CASES; do
+    if [ "$(entry_proto_of "$_ec")" = "$1" ]; then
+      emit_client_line "$(var "U_ENTRY_$_ec")" "entry-case$_ec" ""
+    fi
+    if [ "$(bridge_proto_of "$_ec")" = "$1" ]; then
+      emit_client_line "$(var "U_BRIDGE_$_ec")" "bridge-case$_ec" "reverse-out-$_ec"
+    fi
+  done
+  if [ "$1" = "reality" ] && [ "$DIRECT_ENABLED" = "1" ]; then
+    emit_client_line "$DIRECT_UUID" "direct" ""
+  fi
+  printf '\n'
+}
+
+emit_in_reality() {
   printf '    {\n'
-  printf '      // %s\n' "$_note"
-  printf '      "tag": "%s",\n' "$_tag"
+  printf '      // REALITY 入站：方案1/4 入口 + 方案2/4 隧道 + 直连，共用端口 %s\n' "$REALITY_PORT"
+  printf '      "tag": "in-reality",\n'
   printf '      "listen": "0.0.0.0",\n'
-  printf '      "port": %s,\n' "$_port"
+  printf '      "port": %s,\n' "$REALITY_PORT"
   printf '      "protocol": "vless",\n'
   printf '      "settings": {\n'
-  if [ "$_proto" = "enc" ]; then
-    printf '        "decryption": "%s",\n' "$DECRYPTION"
-  else
-    printf '        "decryption": "none",\n'
-  fi
+  printf '        "decryption": "none",\n'
   printf '        "clients": [\n'
-  if [ -n "$_rev" ]; then
-    printf '          { "id": "%s", "flow": "xtls-rprx-vision", "reverse": { "tag": "%s" } }\n' "$_id" "$_rev"
-  elif [ -n "$_email" ]; then
-    printf '          { "id": "%s", "email": "%s", "flow": "xtls-rprx-vision" }\n' "$_id" "$_email"
-  else
-    printf '          { "id": "%s", "flow": "xtls-rprx-vision" }\n' "$_id"
-  fi
+  emit_clients_for reality
   printf '        ]\n'
   printf '      },\n'
   printf '      "streamSettings": {\n'
-  if [ "$_proto" = "enc" ]; then
-    enc_stream_block
-  else
-    reality_stream_block
-  fi
+  reality_stream_block
   printf '      }\n'
   printf '    }\n'
 }
 
-emit_inbounds() {
-  _first=1
-  for _c in $CASES; do
-    _ep=$(cat "$WD/c${_c}.entry_port")
-    _bp=$(cat "$WD/c${_c}.bridge_port")
-    _eid=$(cat "$WD/c${_c}.entry_id")
-    _bid=$(cat "$WD/c${_c}.bridge_id")
-    _eemail=$(cat "$WD/c${_c}.entry_email")
-
-    [ "$_first" -eq 1 ] || printf ',\n'
-    _first=0
-
-    if [ "$(entry_proto_of "$_c")" = "reality" ]; then
-      emit_inbound "user-case-${_c}" "$_ep" reality "$_eid" "$_eemail" "" \
-        "方案${_c} 用户接入（VLESS+REALITY）-> reverse-out-${_c}"
-    else
-      emit_inbound "user-case-${_c}" "$_ep" enc "$_eid" "$_eemail" "" \
-        "方案${_c} 用户接入（VLESS Encryption）-> reverse-out-${_c}"
-    fi
-
-    printf ',\n'
-
-    if [ "$(bridge_proto_of "$_c")" = "reality" ]; then
-      emit_inbound "bridge-case-${_c}" "$_bp" reality "$_bid" "" "reverse-out-${_c}" \
-        "方案${_c} 隧道入口（VLESS+REALITY）"
-    else
-      emit_inbound "bridge-case-${_c}" "$_bp" enc "$_bid" "" "reverse-out-${_c}" \
-        "方案${_c} 隧道入口（VLESS Encryption）"
-    fi
-  done
-
-  if [ "$DIRECT_ENABLED" = "1" ]; then
-    printf ',\n'
-    emit_inbound "user-direct" "$DIRECT_PORT" reality "$(cat "$WD/direct.uuid")" "$DIRECT_EMAIL" "" \
-      "中转 VPS 直连节点（VLESS+REALITY）"
-  fi
-  printf '\n'
+emit_in_enc() {
+  printf '    {\n'
+  printf '      // VLESS Encryption 入站：方案2/3 入口 + 方案1/3 隧道，共用端口 %s\n' "$ENC_PORT"
+  printf '      "tag": "in-enc",\n'
+  printf '      "listen": "0.0.0.0",\n'
+  printf '      "port": %s,\n' "$ENC_PORT"
+  printf '      "protocol": "vless",\n'
+  printf '      "settings": {\n'
+  printf '        "decryption": "%s",\n' "$DECRYPTION"
+  printf '        "clients": [\n'
+  emit_clients_for enc
+  printf '        ]\n'
+  printf '      },\n'
+  printf '      "streamSettings": {\n'
+  enc_stream_block
+  printf '      }\n'
+  printf '    }\n'
 }
 
-emit_routing_rules() {
-  _first=1
-  for _c in $CASES; do
-    if [ "$_first" -eq 1 ]; then
-      _first=0
-    else
+emit_rules() {
+  _rn=0
+  for _rc in $CASES; do
+    if [ "$_rn" -gt 0 ]; then
       printf ',\n'
     fi
-    printf '      { "inboundTag": ["user-case-%s"], "outboundTag": "reverse-out-%s" }' "$_c" "$_c"
+    _rn=$((_rn + 1))
+    printf '      { "inboundTag": ["%s"], "user": ["entry-case%s"], "outboundTag": "reverse-out-%s" }' \
+      "$(entry_inbound_of "$_rc")" "$_rc" "$_rc"
   done
   if [ "$DIRECT_ENABLED" = "1" ]; then
-    printf ',\n'
-    printf '      { "inboundTag": ["user-direct"], "outboundTag": "direct" }'
+    if [ "$_rn" -gt 0 ]; then
+      printf ',\n'
+    fi
+    printf '      { "inboundTag": ["in-reality"], "user": ["direct"], "outboundTag": "direct" }'
   fi
   printf '\n'
 }
 
-write_server_config() {
-  cat > "$CONF" <<EOF
+write_server_config_to() {
+  _cfg_out=$1
+  _inb=''
+  if need_reality; then
+    _inb=$(emit_in_reality)
+  fi
+  if need_enc; then
+    if [ -n "$_inb" ]; then
+      _inb="$_inb,
+"
+    fi
+    _inb="${_inb}$(emit_in_enc)"
+  fi
+  _rules=$(emit_rules)
+
+  cat > "$_cfg_out" <<EOF
 {
-  // 本文件由 xray-reverse-setup.sh 生成，修改后请执行：xray run -test -c $CONF
+  // 由 xray-reverse-setup.sh 生成；修改后请执行：xray run -test -c $CONF
   "log": { "loglevel": "warning" },
   "inbounds": [
-$(emit_inbounds)
+$_inb
   ],
   "outbounds": [
-    // 必须保留明确的默认出站，避免未命中规则的流量误入反向隧道
+    // 保留明确的默认出站，避免未命中规则的流量误入反向隧道
     { "protocol": "freedom", "tag": "direct" }
   ],
   "routing": {
     "domainStrategy": "AsIs",
     "rules": [
-$(emit_routing_rules)
+$_rules
     ]
   }
 }
 EOF
 }
 
-# ---------------------------------------------------------------- 客户端配置
+# ---------------------------------------------------------------- 客户端产物
 client_reality_stream() {
   printf '      "streamSettings": {\n'
   printf '        "method": "raw",\n'
@@ -648,10 +822,10 @@ client_enc_stream() {
 # 出口（落地）设备配置：$1=case
 write_bridge_client() {
   _c=$1
-  _bid=$(cat "$WD/c${_c}.bridge_id")
-  _bp=$(cat "$WD/c${_c}.bridge_port")
+  _bid=$(var "U_BRIDGE_$_c")
+  _bp=$(bridge_port_of "$_c")
   _bproto=$(bridge_proto_of "$_c")
-  _f="${OUT_DIR}/xray-bridge-case${_c}.jsonc"
+  _f="$OUT_DIR/xray-bridge-case${_c}.jsonc"
 
   if [ "$_bproto" = "reality" ]; then
     _b_enc='none'
@@ -707,9 +881,8 @@ EOF
 # 入口设备为 VLESS Encryption（方案2/3）时的客户端配置：$1=case
 write_entry_enc_client() {
   _c=$1
-  _eid=$(cat "$WD/c${_c}.entry_id")
-  _ep=$(cat "$WD/c${_c}.entry_port")
-  _f="${OUT_DIR}/xray-entry-case${_c}.jsonc"
+  _eid=$(var "U_ENTRY_$_c")
+  _f="$OUT_DIR/xray-entry-case${_c}.jsonc"
 
   cat > "$_f" <<EOF
 {
@@ -725,7 +898,7 @@ write_entry_enc_client() {
       "tag": "proxy",
       "settings": {
         "address": "${VPS_HOST}",
-        "port": ${_ep},
+        "port": ${ENC_PORT},
         "id": "${_eid}",
         "encryption": "${ENCRYPTION}",
         "flow": "xtls-rprx-vision"
@@ -740,29 +913,51 @@ EOF
   info "已生成：$_f（方案${_c} 入口设备境外端配置）"
 }
 
+write_all_clients() {
+  for _wc in $CASES; do
+    write_bridge_client "$_wc"
+    if [ "$(entry_proto_of "$_wc")" = "enc" ]; then
+      write_entry_enc_client "$_wc"
+    fi
+  done
+  # 清理已取消方案的生成文件
+  for _wc in 1 2 3 4; do
+    case " $CASES " in
+      *" $_wc "*) : ;;
+      *) rm -f "$OUT_DIR/xray-bridge-case${_wc}.jsonc" "$OUT_DIR/xray-entry-case${_wc}.jsonc" ;;
+    esac
+  done
+}
+
 print_case_link() {
   _c=$1
-  _eid=$(cat "$WD/c${_c}.entry_id")
-  _ep=$(cat "$WD/c${_c}.entry_port")
   printf '    方案%s: vless://%s@%s:%s?security=reality&flow=xtls-rprx-vision&type=tcp&sni=%s&pbk=%s&sid=%s&fp=chrome#case%s\n' \
-    "$_c" "$_eid" "$VPS_HOST" "$_ep" "$SNI_HOST" "$REALITY_PUBLIC_KEY" "$SHORT_ID" "$_c"
+    "$_c" "$(var "U_ENTRY_$_c")" "$VPS_HOST" "$REALITY_PORT" "$SNI_HOST" "$REALITY_PUBLIC_KEY" "$SHORT_ID" "$_c"
+}
+
+print_direct_link() {
+  printf '    直连: vless://%s@%s:%s?security=reality&flow=xtls-rprx-vision&type=tcp&sni=%s&pbk=%s&sid=%s&fp=chrome#vps-direct\n' \
+    "$DIRECT_UUID" "$VPS_HOST" "$REALITY_PORT" "$SNI_HOST" "$REALITY_PUBLIC_KEY" "$SHORT_ID"
 }
 
 write_credentials() {
-  _f="${OUT_DIR}/xray-deploy/credentials.txt"
+  _f="$OUT_DIR/xray-deploy/credentials.txt"
+  mkdir -p "${_f%/*}"
   {
     echo "== 服务端信息 =="
     echo "VPS_IP=${VPS_HOST}"
     echo "REALITY target: ${REALITY_TARGET}  SNI: ${SNIS}"
     echo "shortId: ${SHORT_ID}"
     echo "REALITY PublicKey(password): ${REALITY_PUBLIC_KEY}"
+    echo "REALITY 端口: ${REALITY_PORT}"
+    echo "VLESS Encryption 端口: ${ENC_PORT}  认证: ${ENC_AUTH:-x25519}"
     echo
     for _c in $CASES; do
       echo "== 方案${_c} =="
-      echo "  入口端口=$(cat "$WD/c${_c}.entry_port") 入口协议=$(entry_proto_of "$_c")"
-      echo "  隧道端口=$(cat "$WD/c${_c}.bridge_port") 隧道协议=$(bridge_proto_of "$_c")"
-      echo "  入口UUID=$(cat "$WD/c${_c}.entry_id")"
-      echo "  隧道UUID=$(cat "$WD/c${_c}.bridge_id")"
+      echo "  入口 inbound=$(entry_inbound_of "$_c") 协议=$(entry_proto_of "$_c") 端口=$(if [ "$(entry_proto_of "$_c")" = reality ]; then echo "$REALITY_PORT"; else echo "$ENC_PORT"; fi)"
+      echo "  入口 UUID=$(var "U_ENTRY_$_c")  email=entry-case${_c}"
+      echo "  隧道 协议=$(bridge_proto_of "$_c") 端口=$(bridge_port_of "$_c")"
+      echo "  隧道 UUID=$(var "U_BRIDGE_$_c")  email=bridge-case${_c}  reverse-out-${_c}"
       echo "  出口设备配置=${OUT_DIR}/xray-bridge-case${_c}.jsonc"
       if [ "$(entry_proto_of "$_c")" = "enc" ]; then
         echo "  入口设备配置=${OUT_DIR}/xray-entry-case${_c}.jsonc"
@@ -771,15 +966,15 @@ write_credentials() {
     done
     if [ "$DIRECT_ENABLED" = "1" ]; then
       echo "== 中转 VPS 直连节点 =="
-      echo "  端口=${DIRECT_PORT}  入口UUID=$(cat "$WD/direct.uuid")"
+      echo "  端口=${REALITY_PORT}  UUID=${DIRECT_UUID}"
     fi
   } > "$_f"
   chmod 600 "$_f"
   info "凭据汇总：$_f"
 }
 
+# ---------------------------------------------------------------- 端口/服务状态
 port_listening() { # 0=在听 1=没在听 2=无法检测
-  # 优先读 /proc（Alpine 等最小化系统常常没有 ss/netstat）
   if [ -r /proc/net/tcp ] || [ -r /proc/net/tcp6 ]; then
     _pl_hex=$(printf '%04X' "$1")
     if awk -v p=":$_pl_hex" '
@@ -799,59 +994,22 @@ port_listening() { # 0=在听 1=没在听 2=无法检测
   fi
 }
 
-print_summary() {
-  echo
-  info "================ 部署完成 ================"
-  echo "  VPS 地址      : ${VPS_HOST}"
-  echo "  REALITY target: ${REALITY_TARGET}  SNI: ${SNIS}"
-  echo "  shortId       : ${SHORT_ID}"
-  echo
-  for _c in $CASES; do
-    echo "  方案${_c}：入口 $(entry_proto_of "$_c")/${VPS_HOST}:$(cat "$WD/c${_c}.entry_port")，隧道 $(bridge_proto_of "$_c")/${VPS_HOST}:$(cat "$WD/c${_c}.bridge_port")"
-  done
-  if [ "$DIRECT_ENABLED" = "1" ]; then
-    echo "  直连节点：REALITY/${VPS_HOST}:${DIRECT_PORT}"
+listen_mark() {
+  if port_listening "$1"; then
+    printf '%s监听中%s' "$C_GREEN" "$C_RESET"
+  else
+    printf '%s未监听%s' "$C_YELLOW" "$C_RESET"
   fi
-
-  echo
-  echo "  == 客户端（入口设备）=="
-  for _c in $CASES; do
-    if [ "$(entry_proto_of "$_c")" = "reality" ]; then
-      print_case_link "$_c"
-    else
-      printf '    方案%s: 使用 %s/xray-entry-case%s.jsonc（VLESS Encryption）\n' "$_c" "$OUT_DIR" "$_c"
-    fi
-  done
-  if [ "$DIRECT_ENABLED" = "1" ]; then
-    printf '    直连: vless://%s@%s:%s?security=reality&flow=xtls-rprx-vision&type=tcp&sni=%s&pbk=%s&sid=%s&fp=chrome#vps-direct\n' \
-      "$(cat "$WD/direct.uuid")" "$VPS_HOST" "$DIRECT_PORT" "$SNI_HOST" "$REALITY_PUBLIC_KEY" "$SHORT_ID"
-  fi
-
-  echo
-  echo "  == 端口监听检查 =="
-  for _p in $ALL_PORTS; do
-    if port_listening "$_p"; then
-      printf '    端口 %-5s : %s监听正常%s\n' "$_p" "$C_GREEN" "$C_RESET"
-    else
-      _st=$?
-      if [ "$_st" -eq 2 ]; then
-        printf '    端口 %-5s : 无法检测（缺少 ss/netstat）\n' "$_p"
-      else
-        printf '    端口 %-5s : %s未监听%s（请查看服务日志）\n' "$_p" "$C_YELLOW" "$C_RESET"
-      fi
-    fi
-  done
-
-  echo
-  info "后续步骤："
-  echo "  1) 出口设备导入 ${OUT_DIR}/xray-bridge-caseN.jsonc 并保持在线"
-  echo "     （方案1/3 隧道为 VLESS Encryption，方案2/4 隧道为 REALITY）。"
-  echo "  2) 入口设备导入上面的分享链接或 ${OUT_DIR}/xray-entry-caseN.jsonc。"
-  echo "  3) 详细凭据见 ${OUT_DIR}/xray-deploy/credentials.txt。"
-  echo "  4) 云厂商安全组 / 防火墙需放行：${ALL_PORTS}"
 }
 
-# ---------------------------------------------------------------- 服务
+service_active() {
+  case "$INIT" in
+    openrc)  rc-service xray status >/dev/null 2>&1 ;;
+    systemd) systemctl is-active --quiet xray >/dev/null 2>&1 ;;
+    *) return 1 ;;
+  esac
+}
+
 service_user() {
   _su=''
   if [ -f /etc/systemd/system/xray.service ]; then
@@ -1014,95 +1172,186 @@ setup_service() {
 
 setup_firewall() {
   if [ "$INIT" = "openrc" ]; then
-    warn "Alpine 默认没有启用防火墙；若有云厂商安全组，请放行：${ALL_PORTS}"
+    warn "Alpine 默认没有启用防火墙；若有云厂商安全组，请放行：${NEED_PORTS}"
     return 0
   fi
 
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
     confirm "检测到 ufw 已启用，放行本次使用的端口？" "Y" || return 0
-    for _p in $ALL_PORTS; do
+    for _p in $NEED_PORTS; do
       ufw allow "${_p}/tcp" >/dev/null
     done
-    info "ufw 已放行：${ALL_PORTS}"
+    info "ufw 已放行：${NEED_PORTS}"
   elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
     confirm "检测到 firewalld 已启用，放行本次使用的端口？" "Y" || return 0
-    for _p in $ALL_PORTS; do
+    for _p in $NEED_PORTS; do
       firewall-cmd --permanent --add-port="${_p}/tcp" >/dev/null
     done
     firewall-cmd --reload >/dev/null
-    info "firewalld 已放行：${ALL_PORTS}"
+    info "firewalld 已放行：${NEED_PORTS}"
   else
-    warn "未检测到已启用的 ufw/firewalld；请自行放行：${ALL_PORTS}"
+    warn "未检测到已启用的 ufw/firewalld；请自行放行：${NEED_PORTS}"
   fi
 }
 
-# ---------------------------------------------------------------- 参数与主流程
-usage() {
-  cat <<'EOF'
-Xray VLESS 反向代理（多场景一对一落地）中转 VPS 部署脚本
-
-用法：
-  # 一条命令（root，交互输入照常）
-  sh -c "$(wget -qO- https://github.com/loser641/xray-reverse-setup/raw/main/xray-reverse-setup.sh)"
-  ./xray-reverse-setup.sh             交互式部署（推荐）
-  ./xray-reverse-setup.sh --defaults  所有提问取默认值（预演/无人值守）
-  ./xray-reverse-setup.sh --help      显示本帮助
-  lray                                部署后安装的快捷命令，重新唤起本脚本
-
-环境变量：
-  NO_COLOR=1              关闭彩色输出
-  XRAY_SETUP_NO_TTY=1     不读取 /dev/tty，仅从 stdin 取输入（CI 用）
-  XRAY_SETUP_OUT_DIR=DIR  客户端配置/凭据输出目录（默认 /root）
-
-方案：
-  1) 出口在国外 / 入口在国内（入口 REALITY，隧道 VLESS Encryption）
-  2) 入口在国外 / 出口在国内（入口 VLESS Encryption，隧道 REALITY）
-  3) 出入口都在国外（两端 VLESS Encryption）
-  4) 出入口都在国内（两端 VLESS+REALITY）
-  可多选：12、1,3、1234
-EOF
+# ---------------------------------------------------------------- 应用配置
+state_ports() {
+  NEED_PORTS=''
+  if need_reality; then
+    NEED_PORTS="$NEED_PORTS $REALITY_PORT"
+  fi
+  if need_enc; then
+    NEED_PORTS="$NEED_PORTS $ENC_PORT"
+  fi
+  NEED_PORTS=$(_trim "$NEED_PORTS")
 }
 
-parse_args() {
-  ASSUME_DEFAULTS=0
-  for _arg in "$@"; do
-    case "$_arg" in
-      -y|--yes|--defaults) ASSUME_DEFAULTS=1 ;;
-      -h|--help) usage; exit 0 ;;
-      *) usage >&2; die "未知参数：$_arg" ;;
-    esac
+validate_state() {
+  _verr=''
+  if ! normalize_cases_var; then
+    _verr="方案组合无效（只允许 1-4，可组合，如 14）"
+  fi
+  if need_reality; then
+    valid_port "$REALITY_PORT" || _verr="REALITY 端口无效（1-65535，无前导零）"
+    valid_short_id "$SHORT_ID" || _verr="shortId 无效（0-f 十六进制、偶数位、≤16 位）"
+    [ -n "$SNIS" ] || _verr="SNI 不能为空"
+    if [ -z "$REALITY_PRIVATE_KEY" ] || [ -z "$REALITY_PUBLIC_KEY" ]; then
+      _verr="缺少 REALITY 密钥"
+    fi
+  fi
+  if need_enc; then
+    valid_port "$ENC_PORT" || _verr="VLESS Encryption 端口无效（1-65535，无前导零）"
+    if [ -z "$DECRYPTION" ] || [ -z "$ENCRYPTION" ]; then
+      _verr="缺少 VLESS Encryption 密钥"
+    fi
+  fi
+  if need_reality && need_enc && [ "$REALITY_PORT" = "$ENC_PORT" ]; then
+    _verr="REALITY 与 VLESS Encryption 不能使用同一端口"
+  fi
+  for _vc in $CASES; do
+    valid_uuid "$(var "U_ENTRY_$_vc")" || _verr="方案$_vc 入口 UUID 无效"
+    valid_uuid "$(var "U_BRIDGE_$_vc")" || _verr="方案$_vc 出口 UUID 无效"
   done
+  if [ "$DIRECT_ENABLED" = "1" ]; then
+    valid_uuid "$DIRECT_UUID" || _verr="直连节点 UUID 无效"
+  fi
+  if [ -n "$_verr" ]; then
+    err "$_verr"
+    return 1
+  fi
+  return 0
 }
 
-main() {
-  parse_args "$@"
+apply_config() {
+  if ! validate_state; then
+    return 1
+  fi
 
-  [ "$(id -u)" -eq 0 ] || die "请使用 root 运行（sudo -i 后重试）。"
+  if ! mkdir -p "${CONF%/*}" 2>/dev/null; then
+    err "无法创建 ${CONF%/*}"
+    return 1
+  fi
 
-  INIT=$(detect_init)
-  info "初始化系统：${INIT}"
-  [ "$INIT" != "none" ] || warn "未检测到 systemd/OpenRC，将跳过服务自动配置。"
+  _cfg_tmp="${CONF}.tmp.$$"
+  write_server_config_to "$_cfg_tmp" || { rm -f "$_cfg_tmp"; return 1; }
 
-  install_lray
+  info "校验配置（xray run -test）..."
+  if ! _test_out=$(xray run -test -c "$_cfg_tmp" 2>&1); then
+    printf '%s\n' "$_test_out" >&2
+    rm -f "$_cfg_tmp"
+    err "配置校验失败，现有配置未修改。"
+    return 1
+  fi
 
-  DIRECT_ENABLED=0
-  ALL_PORTS=''
-  OUT_DIR=${XRAY_SETUP_OUT_DIR:-/root}
+  if [ -f "$CONF" ]; then
+    _cfg_bak="${CONF}.bak.$(date +%Y%m%d%H%M%S)"
+    if cp -a "$CONF" "$_cfg_bak" 2>/dev/null; then
+      info "已备份旧配置：$_cfg_bak"
+    else
+      warn "旧配置备份失败：$_cfg_bak"
+    fi
+  fi
 
-  WD=$(mktemp -d "${TMPDIR:-/tmp}/xray-setup.XXXXXX") || {
-    WD="/tmp/xray-setup.$$"
-    mkdir -p "$WD"
-  }
-  trap 'rm -rf "$WD"' EXIT INT TERM
+  if ! mv "$_cfg_tmp" "$CONF"; then
+    rm -f "$_cfg_tmp"
+    err "写入 $CONF 失败。"
+    return 1
+  fi
+  secure_config || true
+  save_state || warn "状态文件写入失败：$STATE"
 
-  CONF="/usr/local/etc/xray/config.json"
-  mkdir -p /usr/local/etc/xray /usr/local/share/xray "$OUT_DIR/xray-deploy"
-  chmod 700 "$OUT_DIR/xray-deploy"
+  write_all_clients || warn "客户端配置生成失败（检查 $OUT_DIR 权限）。"
+  write_credentials || warn "凭据文件写入失败。"
 
+  state_ports
+  setup_service
+  return 0
+}
+
+# ---------------------------------------------------------------- 展示
+print_summary() {
+  state_ports
+  echo
+  info "================ 配置概览 ================"
+  echo "  VPS 地址      : ${VPS_HOST}"
+  echo "  REALITY target: ${REALITY_TARGET}"
+  echo "  SNI           : ${SNIS}"
+  echo "  shortId       : ${SHORT_ID}"
+  if need_reality; then
+    echo "  REALITY       : ${VPS_HOST}:${REALITY_PORT}  ($(listen_mark "$REALITY_PORT"))"
+  fi
+  if need_enc; then
+    echo "  VLESS Enc     : ${VPS_HOST}:${ENC_PORT}  ($(listen_mark "$ENC_PORT"))  认证 ${ENC_AUTH:-x25519}"
+  fi
+  echo "  方案          : ${CASES}"
+  if [ "$DIRECT_ENABLED" = "1" ]; then
+    echo "  直连节点      : REALITY/${VPS_HOST}:${REALITY_PORT}"
+  fi
+
+  echo
+  echo "  == 客户端（入口设备）=="
+  for _sc in $CASES; do
+    if [ "$(entry_proto_of "$_sc")" = "reality" ]; then
+      print_case_link "$_sc"
+    else
+      printf '    方案%s: 使用 %s/xray-entry-case%s.jsonc（VLESS Encryption）\n' \
+        "$_sc" "$OUT_DIR" "$_sc"
+    fi
+  done
+  if [ "$DIRECT_ENABLED" = "1" ]; then
+    print_direct_link
+  fi
+
+  echo
+  echo "  == 出口设备 =="
+  for _sc in $CASES; do
+    printf '    方案%s: %s/xray-bridge-case%s.jsonc（隧道 %s/%s）\n' \
+      "$_sc" "$OUT_DIR" "$_sc" "$(bridge_proto_of "$_sc")" "$(bridge_port_of "$_sc")"
+  done
+
+  echo
+  echo "  == 服务 =="
+  if service_active; then
+    echo "    Xray 服务运行中"
+  else
+    echo "    Xray 服务未运行（查看服务日志）"
+  fi
+  echo "    凭据文件: ${OUT_DIR}/xray-deploy/credentials.txt"
+  echo "    管理面板: 输入 lray"
+  echo
+  if [ -n "$NEED_PORTS" ]; then
+    info "需放行的 TCP 端口：${NEED_PORTS}"
+  fi
+}
+
+# ---------------------------------------------------------------- 安装
+run_install() {
   install_xray
 
   echo
-  info "==== 开始收集部署参数 ===="
+  info "==== 开始部署 ===="
+  init_state_defaults
+
   _detected_ip=$(detect_public_ip)
   VPS_HOST=$(ask "VPS 公网 IP 或域名" "${_detected_ip:-}")
   [ -n "$VPS_HOST" ] || die "VPS 地址不能为空。"
@@ -1113,15 +1362,8 @@ main() {
     *)   REALITY_TARGET="${REALITY_TARGET}:443" ;;
   esac
   SNI_HOST=${REALITY_TARGET%%:*}
-  SNIS=$(ask "SNI 列表（逗号分隔，默认与 target 主机名一致）" "$SNI_HOST")
+  SNIS=$(ask "SNI 列表（逗号分隔）" "$SNI_HOST")
   [ -n "$SNIS" ] || die "SNI 不能为空。"
-
-  _def_sid=$(xray uuid | tr -d '-' | cut -c1-4)
-  while :; do
-    SHORT_ID=$(ask "REALITY shortId（0-f 十六进制、偶数位、不超过 16 位）" "$_def_sid")
-    valid_short_id "$SHORT_ID" && break
-    warn "shortId 必须是 0-f 十六进制、偶数位、不超过 16 位，且不能为空。"
-  done
 
   echo
   info "请选择要部署的方案（可多选，如 1、4、12、1,3、1234）："
@@ -1130,7 +1372,7 @@ main() {
   echo "  3) 出入口都在国外（两端 VLESS Encryption）"
   echo "  4) 出入口都在国内（两端 VLESS+REALITY）"
   _case_choice=$(normalize_cases "$(ask "方案组合" "4")")
-  validate_cases "$_case_choice" || die "无效方案组合：$_case_choice（只允许 1-4）"
+  valid_cases "$_case_choice" || die "无效方案组合：$_case_choice（只允许 1-4）"
 
   CASES=''
   _seen=''
@@ -1147,103 +1389,431 @@ main() {
   [ -n "$CASES" ] || die "请至少选择一个方案。"
   info "已选择方案：${CASES}"
 
-  for _c in $CASES; do
-    echo
-    info "配置方案${_c}："
-    _def_ep=$(default_entry_port "$_c")
-    _def_bp=$(default_bridge_port "$_c")
-
-    while :; do
-      _ep=$(ask "方案${_c} 入口端口" "$_def_ep")
-      valid_port "$_ep" && break
-      warn "端口无效（1-65535，且不要前导零）。"
-    done
-    while :; do
-      _bp=$(ask "方案${_c} 隧道端口" "$_def_bp")
-      valid_port "$_bp" && break
-      warn "端口无效（1-65535，且不要前导零）。"
-    done
-    _eemail=$(ask "方案${_c} 用户 email" "user-case${_c}")
-    [ -n "$_eemail" ] || die "email 不能为空。"
-
-    printf '%s\n' "$_ep" > "$WD/c${_c}.entry_port"
-    printf '%s\n' "$_bp" > "$WD/c${_c}.bridge_port"
-    printf '%s\n' "$_eemail" > "$WD/c${_c}.entry_email"
-    xray uuid > "$WD/c${_c}.entry_id"
-    xray uuid > "$WD/c${_c}.bridge_id"
-    ALL_PORTS="${ALL_PORTS} ${_ep} ${_bp}"
-  done
-
-  if printf '%s\n' $ALL_PORTS | sed '/^$/d' | sort | uniq -d | grep -q .; then
-    die "所选端口存在重复，请重新运行并避免重复端口。"
-  fi
-
   echo
-  if confirm "是否需要额外添加一个“出口为本中转 VPS”的 VLESS+REALITY 单节点？" "Y"; then
+  if confirm "是否额外添加一个“出口为本中转 VPS”的 VLESS+REALITY 直连节点？" "Y"; then
     DIRECT_ENABLED=1
-    DIRECT_EMAIL=$(ask "直连节点用户 email" "direct")
+  else
+    DIRECT_ENABLED=0
+  fi
+
+  if need_reality; then
     while :; do
-      DIRECT_PORT=$(ask "直连节点端口" "57717")
-      valid_port "$DIRECT_PORT" && break
-      warn "端口无效。"
+      REALITY_PORT=$(ask "REALITY 端口" "$DEFAULT_REALITY_PORT")
+      valid_port "$REALITY_PORT" && break
+      warn "端口无效（1-65535，且不要前导零）。"
     done
-    case " ${ALL_PORTS} " in
-      *" ${DIRECT_PORT} "*) die "直连节点端口与方案端口重复：${DIRECT_PORT}" ;;
+  fi
+  if need_enc; then
+    while :; do
+      ENC_PORT=$(ask "VLESS Encryption 端口" "$DEFAULT_ENC_PORT")
+      valid_port "$ENC_PORT" || { warn "端口无效。"; continue; }
+      if need_reality && [ "$ENC_PORT" = "$REALITY_PORT" ]; then
+        warn "不能与 REALITY 端口相同。"
+        continue
+      fi
+      break
+    done
+  fi
+
+  SHORT_ID=$(gen_short_id)
+  info "已随机生成 shortId：$SHORT_ID"
+
+  if need_enc; then
+    echo
+    info "VLESS Encryption 认证方式（服务端与客户端必须一致）："
+    echo "  1) X25519（默认，较短）"
+    echo "  2) ML-KEM-768（后量子，较长）"
+    _ve_choice=$(ask "选择 [1/2]" "1")
+    case "$_ve_choice" in
+      1) ENC_AUTH=x25519 ;;
+      2) ENC_AUTH=mlkem ;;
+      *) die "无效选择：$_ve_choice（应为 1 或 2）" ;;
     esac
-    ALL_PORTS="${ALL_PORTS} ${DIRECT_PORT}"
-    xray uuid > "$WD/direct.uuid"
+  else
+    ENC_AUTH=x25519
   fi
 
-  echo
-  info "VLESS Encryption 认证方式（服务端与客户端必须一致）："
-  echo "  1) X25519（默认，较短）"
-  echo "  2) ML-KEM-768（后量子，较长）"
-  _ve_choice=$(ask "选择 [1/2]" "1")
-  case "$_ve_choice" in
-    1) gen_vlessenc x25519 ;;
-    2) gen_vlessenc mlkem ;;
-    *) die "无效选择：$_ve_choice（应为 1 或 2）" ;;
-  esac
+  info "生成随机凭证（UUID / REALITY 密钥 / Encryption 密钥）..."
+  ensure_credentials
 
-  gen_reality_keys
-
-  _bak=''
-  if [ -f "$CONF" ]; then
-    if confirm "检测到已有 $CONF，备份后覆盖？" "Y"; then
-      _bak="${CONF}.bak.$(date +%Y%m%d%H%M%S)"
-      cp -a "$CONF" "$_bak"
-      info "已备份到 $_bak"
-    else
-      die "已取消，请先手动处理 $CONF 后重试。"
-    fi
+  if ! apply_config; then
+    die "部署失败，请根据上面的提示处理后重试。"
   fi
 
-  write_server_config
-  secure_config
-
-  info "校验配置（xray run -test）..."
-  if ! _test_out=$(xray run -test -c "$CONF" 2>&1); then
-    printf '%s\n' "$_test_out" >&2
-    if [ -n "$_bak" ]; then
-      cp -a "$_bak" "$CONF"
-      secure_config
-      warn "配置校验失败，已还原备份配置。"
-    fi
-    die "配置校验失败，请根据上面的报错修正后重试。"
-  fi
-  info "配置校验通过。"
-
-  for _c in $CASES; do
-    write_bridge_client "$_c"
-    if [ "$(entry_proto_of "$_c")" = "enc" ]; then
-      write_entry_enc_client "$_c"
-    fi
-  done
-  write_credentials
-
-  setup_service
   setup_firewall
   print_summary
+}
+
+# ---------------------------------------------------------------- 管理面板
+panel_edit_target() {
+  _old_sni=$SNI_HOST
+  _t=$(ask "REALITY target（域名:端口）" "$REALITY_TARGET")
+  case "$_t" in
+    *:*) : ;;
+    *)   _t="${_t}:443" ;;
+  esac
+  REALITY_TARGET=$_t
+  SNI_HOST=${REALITY_TARGET%%:*}
+  if [ "$SNIS" = "$_old_sni" ]; then
+    SNIS=$SNI_HOST
+  fi
+  _s=$(ask "SNI 列表（逗号分隔）" "$SNIS")
+  [ -n "$_s" ] || _s=$SNI_HOST
+  SNIS=$_s
+  DIRTY=1
+  info "已更新 target/SNI（记得应用）"
+}
+
+panel_edit_shortid() {
+  _sid=$(ask "shortId（直接回车 = 重新随机生成）" "")
+  if [ -z "$_sid" ]; then
+    _sid=$(gen_short_id)
+  fi
+  if valid_short_id "$_sid"; then
+    SHORT_ID=$_sid
+    DIRTY=1
+    info "shortId 已更新：$SHORT_ID（记得应用）"
+  else
+    err "shortId 无效：0-f 十六进制、偶数位、不超过 16 位"
+  fi
+}
+
+panel_edit_ports() {
+  if need_reality; then
+    while :; do
+      _p=$(ask "REALITY 端口" "$REALITY_PORT")
+      valid_port "$_p" && break
+      warn "端口无效。"
+    done
+    REALITY_PORT=$_p
+  fi
+  if need_enc; then
+    while :; do
+      _p=$(ask "VLESS Encryption 端口" "$ENC_PORT")
+      valid_port "$_p" || { warn "端口无效。"; continue; }
+      if need_reality && [ "$_p" = "$REALITY_PORT" ]; then
+        warn "不能与 REALITY 端口相同。"
+        continue
+      fi
+      break
+    done
+    ENC_PORT=$_p
+  fi
+  DIRTY=1
+  info "端口已更新（记得应用）"
+}
+
+panel_edit_uuid() {
+  echo
+  echo "  == 当前 UUID =="
+  _ci=1
+  for _c in 1 2 3 4; do
+    printf '  %s) 方案%s 入口  %s\n' "$_ci" "$_c" "$(var "U_ENTRY_$_c")"
+    _ci=$((_ci + 1))
+  done
+  for _c in 1 2 3 4; do
+    printf '  %s) 方案%s 出口  %s\n' "$_ci" "$_c" "$(var "U_BRIDGE_$_c")"
+    _ci=$((_ci + 1))
+  done
+  printf '  9) 直连节点  %s\n' "${DIRECT_UUID:-（未生成）}"
+  printf '  0) 返回\n'
+
+  _n=$(ask "选择要修改的项" "0")
+  case "$_n" in
+    1|2|3|4)
+      _var="U_ENTRY_$_n"; _label="方案${_n} 入口" ;;
+    5|6|7|8)
+      _idx=$((_n - 4)); _var="U_BRIDGE_$_idx"; _label="方案${_idx} 出口" ;;
+    9)
+      _var="DIRECT_UUID"; _label="直连节点" ;;
+    0)
+      return 0 ;;
+    *)
+      warn "无效选择。"; return 0 ;;
+  esac
+
+  _v=$(ask "$_label 新 UUID（直接回车 = 重新生成）" "")
+  if [ -z "$_v" ]; then
+    _v=$(xray uuid)
+  fi
+  if valid_uuid "$_v"; then
+    setvar "$_var" "$_v"
+    DIRTY=1
+    info "$_label UUID 已更新：$_v（记得应用）"
+  else
+    err "UUID 无效（标准 8-4-4-4-12 格式）"
+  fi
+}
+
+panel_regen_reality() {
+  confirm "重新生成 REALITY 密钥对？所有 REALITY 客户端都要换新配置。" "N" || return 0
+  gen_reality_keys
+  DIRTY=1
+  info "新公钥：$REALITY_PUBLIC_KEY（记得应用并更新客户端）"
+}
+
+panel_edit_enc() {
+  echo
+  echo "  当前认证：${ENC_AUTH:-x25519}"
+  echo "  decryption: $(printf '%s' "$DECRYPTION" | cut -c1-40)..." 
+  echo "  1) 重新生成 X25519 对"
+  echo "  2) 重新生成 ML-KEM-768 对"
+  echo "  3) 手动粘贴 decryption / encryption"
+  echo "  0) 返回"
+  _n=$(ask "选择" "0")
+  case "$_n" in
+    1) gen_vlessenc x25519; DIRTY=1; info "已重新生成 X25519 对（记得应用）" ;;
+    2) gen_vlessenc mlkem;  DIRTY=1; info "已重新生成 ML-KEM-768 对（记得应用）" ;;
+    3)
+      _d=$(ask "decryption（服务端）" "")
+      _e=$(ask "encryption（客户端）" "")
+      if [ -z "$_d" ] || [ -z "$_e" ]; then
+        err "两个值都不能为空。"
+        return 0
+      fi
+      _pd=$(printf '%s' "$_d" | cut -d. -f1-2)
+      _pe=$(printf '%s' "$_e" | cut -d. -f1-2)
+      if [ "$_pd" != "$_pe" ]; then
+        err "两段密钥的算法前缀不一致（$_pd vs $_pe），请确认是同一对。"
+        return 0
+      fi
+      DECRYPTION=$_d
+      ENCRYPTION=$_e
+      ENC_AUTH=$(enc_auth_of)
+      DIRTY=1
+      info "密钥已更新，认证=${ENC_AUTH}（记得应用）"
+      ;;
+    0) : ;;
+    *) warn "无效选择。" ;;
+  esac
+}
+
+panel_edit_cases() {
+  echo
+  echo "  1) 出口在国外 / 入口在国内（入口 REALITY，隧道 Encryption）"
+  echo "  2) 入口在国外 / 出口在国内（入口 Encryption，隧道 REALITY）"
+  echo "  3) 出入口都在国外（两端 Encryption）"
+  echo "  4) 出入口都在国内（两端 REALITY）"
+  _cc=$(normalize_cases "$(ask "方案组合（直接回车保持不变）" "$CASES")")
+  if [ -z "$_cc" ]; then
+    return 0
+  fi
+  if ! valid_cases "$_cc"; then
+    err "无效方案组合。"
+    return 0
+  fi
+  _new=''
+  _seen=''
+  _rest=$_cc
+  while [ -n "$_rest" ]; do
+    _ch=${_rest%"${_rest#?}"}
+    _rest=${_rest#?}
+    case " $_seen " in
+      *" $_ch "*) continue ;;
+    esac
+    _seen="${_seen} ${_ch}"
+    _new="${_new:+$_new }${_ch}"
+  done
+  CASES=$_new
+  DIRTY=1
+  info "方案已更新为：$CASES（记得应用）"
+}
+
+panel_toggle_direct() {
+  if [ "$DIRECT_ENABLED" = "1" ]; then
+    DIRECT_ENABLED=0
+    info "已关闭直连节点（记得应用）"
+  else
+    DIRECT_ENABLED=1
+    [ -n "$DIRECT_UUID" ] || DIRECT_UUID=$(xray uuid)
+    info "已开启直连节点（记得应用）"
+  fi
+  DIRTY=1
+}
+
+panel_status() {
+  echo
+  info "服务状态："
+  case "$INIT" in
+    openrc)  rc-service xray status 2>&1 | tail -3 ;;
+    systemd) systemctl status xray --no-pager 2>&1 | head -8 ;;
+    *)       echo "  未检测到 systemd/OpenRC" ;;
+  esac
+  echo
+  state_ports
+  for _p in $NEED_PORTS; do
+    printf '  端口 %-5s : %s\n' "$_p" "$(listen_mark "$_p")"
+  done
+  echo
+  if xray run -test -c "$CONF" >/dev/null 2>&1; then
+    echo "  配置文件校验：OK（$CONF）"
+  else
+    echo "  配置文件校验：失败"
+  fi
+  [ -f "$STATE" ] && echo "  状态文件：$STATE"
+}
+
+panel_apply() {
+  echo
+  info "生成缺失凭证并应用配置..."
+  ensure_credentials
+  if apply_config; then
+    DIRTY=0
+    setup_firewall
+    print_summary
+    return 0
+  fi
+  err "应用失败，未修改现有配置；可继续在面板中调整。"
+  return 1
+}
+
+panel_render() {
+  echo
+  info "================ Xray 管理面板 ================"
+  if service_active; then
+    echo "  服务: 运行中"
+  else
+    echo "  服务: 未运行"
+  fi
+  if need_reality; then
+    printf '  REALITY 端口 : %-5s %s\n' "$REALITY_PORT" "$(listen_mark "$REALITY_PORT")"
+  fi
+  if need_enc; then
+    printf '  Enc 端口     : %-5s %s\n' "$ENC_PORT" "$(listen_mark "$ENC_PORT")"
+  fi
+  printf '  方案         : %s   直连: %s\n' "${CASES:-无}" "$([ "$DIRECT_ENABLED" = 1 ] && echo 开 || echo 关)"
+  printf '  target       : %s   SNI: %s\n' "$REALITY_TARGET" "$SNIS"
+  printf '  shortId      : %s   Enc认证: %s\n' "$SHORT_ID" "${ENC_AUTH:-x25519}"
+  if [ "$DIRTY" = "1" ]; then
+    warn "有未应用的修改（选 10 应用）"
+  fi
+  echo
+  echo "   1) 查看凭据 / 分享链接 / 客户端文件"
+  echo "   2) 修改 REALITY target / SNI"
+  echo "   3) 修改 shortId"
+  echo "   4) 修改端口（REALITY / Encryption）"
+  echo "   5) 修改 UUID（按方案入口/出口/直连）"
+  echo "   6) 重新生成 REALITY 密钥对"
+  echo "   7) 修改 / 重新生成 VLESS Encryption 密钥"
+  echo "   8) 修改方案组合"
+  echo "   9) 开关直连节点"
+  echo "  10) 应用配置（写入 + 校验 + 重启 + 重建客户端）"
+  echo "  11) 查看服务/端口/配置校验状态"
+  echo "   0) 退出"
+}
+
+panel_main() {
+  if ! load_state; then
+    warn "未找到有效的部署状态（$STATE）。"
+    if confirm "现在进入安装流程？" "Y"; then
+      run_install
+    fi
+    return 0
+  fi
+
+  DIRTY=0
+  while :; do
+    panel_render
+    _pc=$(ask "选择操作" "0")
+    case "$_pc" in
+      1)  print_summary ;;
+      2)  panel_edit_target ;;
+      3)  panel_edit_shortid ;;
+      4)  panel_edit_ports ;;
+      5)  panel_edit_uuid ;;
+      6)  panel_regen_reality ;;
+      7)  panel_edit_enc ;;
+      8)  panel_edit_cases ;;
+      9)  panel_toggle_direct ;;
+      10) panel_apply ;;
+      11) panel_status ;;
+      0)
+        if [ "$DIRTY" = "1" ]; then
+          confirm "有未应用的修改，确定退出？" "N" && return 0
+        else
+          return 0
+        fi
+        ;;
+      *) warn "无效选择：$_pc" ;;
+    esac
+  done
+}
+
+# ---------------------------------------------------------------- 参数与入口
+usage() {
+  cat <<'EOF'
+Xray VLESS 反向代理（多场景一对一落地）中转 VPS 部署 / 管理脚本
+
+用法：
+  # 一条命令安装（root，交互输入照常）
+  sh -c "$(wget -qO- https://github.com/loser641/xray-reverse-setup/raw/main/xray-reverse-setup.sh)"
+  lray                                已安装时打开管理面板
+  ./xray-reverse-setup.sh             已部署则打开面板，否则安装
+  ./xray-reverse-setup.sh --panel     打开管理面板
+  ./xray-reverse-setup.sh --install   重新安装/部署
+  ./xray-reverse-setup.sh --defaults  安装时全部取默认值（无人值守）
+  ./xray-reverse-setup.sh --help      显示本帮助
+
+端口默认值：
+  REALITY 入站        40443（方案1/4 入口 + 方案2/4 隧道 + 直连）
+  VLESS Encryption    50443（方案2/3 入口 + 方案1/3 隧道）
+
+同一协议的方案共用一个入站/端口，通过不同 UUID（用户）区分，
+路由按用户邮箱 entry-caseN -> reverse-out-N。
+
+环境变量：
+  NO_COLOR=1              关闭彩色输出
+  XRAY_SETUP_NO_TTY=1     不读取 /dev/tty，仅从 stdin 取输入（CI 用）
+  XRAY_SETUP_OUT_DIR=DIR  客户端配置/凭据输出目录（默认 /root）
+EOF
+}
+
+parse_args() {
+  ASSUME_DEFAULTS=0
+  MODE=auto
+  for _arg in "$@"; do
+    case "$_arg" in
+      -y|--yes|--defaults) ASSUME_DEFAULTS=1; MODE=install ;;
+      --install) MODE=install ;;
+      --panel)   MODE=panel ;;
+      -h|--help) usage; exit 0 ;;
+      *) usage >&2; die "未知参数：$_arg" ;;
+    esac
+  done
+}
+
+main() {
+  parse_args "$@"
+
+  [ "$(id -u)" -eq 0 ] || die "请使用 root 运行（sudo -i 后重试）。"
+
+  INIT=$(detect_init)
+  info "初始化系统：${INIT}"
+  [ "$INIT" != "none" ] || warn "未检测到 systemd/OpenRC，将跳过服务自动配置。"
+
+  OUT_DIR=${XRAY_SETUP_OUT_DIR:-/root}
+  mkdir -p /usr/local/etc/xray /usr/local/share/xray "$OUT_DIR/xray-deploy"
+  chmod 700 "$OUT_DIR/xray-deploy"
+
+  WD=$(mktemp -d "${TMPDIR:-/tmp}/xray-setup.XXXXXX") || {
+    WD="/tmp/xray-setup.$$"
+    mkdir -p "$WD"
+  }
+  trap 'rm -rf "$WD"' EXIT INT TERM
+
+  install_lray
+
+  case "$MODE" in
+    install) run_install ;;
+    panel)   panel_main ;;
+    auto)
+      if state_ready; then
+        panel_main
+      else
+        run_install
+      fi
+      ;;
+  esac
 }
 
 main "$@"
