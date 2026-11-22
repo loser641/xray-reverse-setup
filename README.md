@@ -151,6 +151,8 @@ uuid、REALITY 密钥对、Encryption 密钥、shortId 均在部署时随机生�
 
 ## 客户端部署
 
+> 客户端内核要求：Xray ≥ 25.9（v2rayNG 1.10+、v2rayN 7.x、mihomo 1.19+）。旧内核（1.8.x 等）连接 Xray 26 服务端会报 `REALITY: verification failed` 或 `REALITY: processed invalid connection`，也不认识 `"method": "raw"` 等新字段——先升级客户端再排查网络。
+
 ### 出口设备（落地）
 
 把对应方案的 `xray-bridge-caseN.jsonc` 导入 v2rayNG（`+` → 从剪贴板导入；连接后 VPN 弹窗点取消，仅代理模式）或 v2rayN（添加自定义配置服务器），**保持在线**。

@@ -45,7 +45,7 @@ export PATH
 
 # 脚本自身地址与版本：lray 用它做离线缓存和“拒绝旧版覆盖”的判断
 SCRIPT_URL="https://github.com/loser641/xray-reverse-setup/raw/main/xray-reverse-setup.sh"
-SCRIPT_REV=6
+SCRIPT_REV=7
 
 CONF="/usr/local/etc/xray/config.json"
 STATE="/usr/local/etc/xray/xray-setup.state"
@@ -824,7 +824,8 @@ client_reality_stream() {
   printf '        "realitySettings": {\n'
   printf '          "serverName": "%s",\n' "$SNI_HOST"
   printf '          "fingerprint": "chrome",\n'
-  printf '          "password": "%s",\n' "$REALITY_PUBLIC_KEY"
+  # publicKey 是 25.x 起的字段名，26 也仍然接受；写它可兼容更多客户端内核
+  printf '          "publicKey": "%s",\n' "$REALITY_PUBLIC_KEY"
   printf '          "shortId": "%s"\n' "$SHORT_ID"
   printf '        }\n'
   printf '      }\n'
