@@ -45,7 +45,7 @@ export PATH
 
 # 脚本自身地址与版本：lray 用它做离线缓存和“拒绝旧版覆盖”的判断
 SCRIPT_URL="https://github.com/loser641/xray-reverse-setup/raw/main/xray-reverse-setup.sh"
-SCRIPT_REV=2
+SCRIPT_REV=3
 
 CONF="/usr/local/etc/xray/config.json"
 STATE="/usr/local/etc/xray/xray-setup.state"
@@ -1017,6 +1017,26 @@ listen_mark() {
   fi
 }
 
+# 重启后端口可能还没绑定，最多等 10 秒再显示状态
+wait_ports() {
+  _wp_i=0
+  while [ "$_wp_i" -lt 10 ]; do
+    _wp_all=1
+    for _wp in $NEED_PORTS; do
+      port_listening "$_wp"
+      case $? in
+        0) : ;;
+        1) _wp_all=0 ;;
+        *) return 0 ;;
+      esac
+    done
+    [ "$_wp_all" -eq 1 ] && return 0
+    sleep 1
+    _wp_i=$((_wp_i + 1))
+  done
+  return 0
+}
+
 service_active() {
   case "$INIT" in
     openrc)  rc-service xray status >/dev/null 2>&1 ;;
@@ -1309,6 +1329,7 @@ apply_config() {
 # ---------------------------------------------------------------- 展示
 print_summary() {
   state_ports
+  wait_ports
   echo
   info "================ 配置概览 ================"
   echo "  VPS 地址      : ${VPS_HOST}"
