@@ -97,7 +97,7 @@ lray --install    # 重新部署（会备份旧配置）
 lray --defaults   # 重新部署时全部取默认值
 ```
 
-面板里可以查看凭据/分享链接，并修改 SNI/target、端口、UUID、shortId、REALITY 密钥、VLESS Encryption 密钥、方案组合和直连开关；改完选“应用配置”才会写入、校验并重启。
+面板里可以查看凭据、分享链接和客户端配置内容，并修改 SNI/target、端口、UUID、shortId、REALITY 密钥、VLESS Encryption 密钥、方案组合和直连开关；改完选“应用配置”才会写入、校验并重启。
 
 `lray` 会先拉取仓库里的最新脚本并更新缓存（`/usr/local/share/xray-setup/`），网络失败时直接运行缓存；`LRAY_OFFLINE=1` 可强制离线。非 root 运行会提示 `sudo lray`。若还没有部署状态，`lray` 会提示进入安装流程。
 
@@ -126,7 +126,7 @@ uuid、REALITY 密钥对、Encryption 密钥、shortId 均在部署时随机生�
 /root/xray-deploy/credentials.txt      全部 UUID / 端口 / 协议汇总
 ```
 
-入口为 REALITY 的方案直接在脚本末尾打印分享链接。取消掉的方案会自动删除对应的 `xray-bridge-caseN.jsonc` / `xray-entry-caseN.jsonc`。
+协议为 REALITY 的入口/出口直接输出 `vless://` 分享链接；VLESS Encryption 无法用分享链接表达，面板和部署结束时会把整份配置（含起止标记）贴出来，直接复制保存即可。出口的 REALITY 链接只用于核对参数，落地设备仍需导入带 `reverse` 的 `xray-bridge-caseN.jsonc`。取消掉的方案会自动删除对应的 `xray-bridge-caseN.jsonc` / `xray-entry-caseN.jsonc`。
 
 ## 服务端配置结构
 
