@@ -16,9 +16,12 @@
 #   可选：额外加一个“出口为本中转 VPS”的 VLESS+REALITY 单节点。
 #
 # 用法：
-#   ./xray-reverse-setup.sh              # 交互式部署
-#   ./xray-reverse-setup.sh --defaults   # 所有提问使用默认值（预演/自动化）
-#   ./xray-reverse-setup.sh --help
+#   一条命令（root，脚本直接从终端读取输入，无需先落盘）：
+#     sh -c "$(wget -qO- https://github.com/loser641/xray-reverse-setup/raw/main/xray-reverse-setup.sh)"
+#   已下载到本地时：
+#     ./xray-reverse-setup.sh              # 交互式部署
+#     ./xray-reverse-setup.sh --defaults   # 所有提问使用默认值（预演/自动化）
+#     ./xray-reverse-setup.sh --help
 #
 # 说明：交互提示一律写到终端（stdout 只用于返回值），因此本脚本既能直接
 #       运行，也能在 `sh -c "$(curl ...)"` / `curl ... | sh` 这类场景下工作。
@@ -950,6 +953,8 @@ usage() {
 Xray VLESS 反向代理（多场景一对一落地）中转 VPS 部署脚本
 
 用法：
+  # 一条命令（root，交互输入照常）
+  sh -c "$(wget -qO- https://github.com/loser641/xray-reverse-setup/raw/main/xray-reverse-setup.sh)"
   ./xray-reverse-setup.sh             交互式部署（推荐）
   ./xray-reverse-setup.sh --defaults  所有提问取默认值（预演/无人值守）
   ./xray-reverse-setup.sh --help      显示本帮助
@@ -982,7 +987,7 @@ parse_args() {
 main() {
   parse_args "$@"
 
-  [ "$(id -u)" -eq 0 ] || die "请使用 root 运行：sudo sh $0"
+  [ "$(id -u)" -eq 0 ] || die "请使用 root 运行（sudo -i 后重试）。"
 
   INIT=$(detect_init)
   info "初始化系统：${INIT}"

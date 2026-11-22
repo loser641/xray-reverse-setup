@@ -53,13 +53,29 @@ flowchart LR
 
 ## 快速开始
 
+root 下一条命令即可（脚本直接从终端读取交互输入，不需要先落盘）：
+
 ```bash
-wget -O xray-reverse-setup.sh https://raw.githubusercontent.com/loser641/xray-reverse-setup/main/xray-reverse-setup.sh
-chmod +x xray-reverse-setup.sh
-./xray-reverse-setup.sh
+sh -c "$(wget -qO- https://github.com/loser641/xray-reverse-setup/raw/main/xray-reverse-setup.sh)"
 ```
 
-没有 wget 时用 `curl -fsSL -o xray-reverse-setup.sh <同上链接>`。
+没有 wget 时用 curl：
+
+```bash
+sh -c "$(curl -fsSL https://github.com/loser641/xray-reverse-setup/raw/main/xray-reverse-setup.sh)"
+```
+
+`sh -c` 的第一个参数是脚本的 `$0`，后面的参数会传给脚本：
+
+```bash
+# 先看用法，不部署
+sh -c "$(wget -qO- https://github.com/loser641/xray-reverse-setup/raw/main/xray-reverse-setup.sh)" xray-setup --help
+
+# 无人值守：全部取默认值（会写配置并重启服务）
+sh -c "$(wget -qO- https://github.com/loser641/xray-reverse-setup/raw/main/xray-reverse-setup.sh)" xray-setup --defaults
+```
+
+也可以先下载再执行：`wget -O xr.sh <脚本链接> && sh xr.sh`。
 
 ### 交互要点
 
