@@ -45,7 +45,7 @@ export PATH
 
 # 脚本自身地址与版本：lray 用它做离线缓存和“拒绝旧版覆盖”的判断
 SCRIPT_URL="https://github.com/loser641/xray-reverse-setup/raw/main/xray-reverse-setup.sh"
-SCRIPT_REV=5
+SCRIPT_REV=6
 
 CONF="/usr/local/etc/xray/config.json"
 STATE="/usr/local/etc/xray/xray-setup.state"
@@ -727,7 +727,7 @@ emit_in_reality() {
   printf '    {\n'
   printf '      // REALITY 入站：方案1/4 入口 + 方案2/4 隧道 + 直连，共用端口 %s\n' "$REALITY_PORT"
   printf '      "tag": "in-reality",\n'
-  printf '      "listen": "0.0.0.0",\n'
+  printf '      "listen": "::",\n'
   printf '      "port": %s,\n' "$REALITY_PORT"
   printf '      "protocol": "vless",\n'
   printf '      "settings": {\n'
@@ -746,7 +746,7 @@ emit_in_enc() {
   printf '    {\n'
   printf '      // VLESS Encryption 入站：方案2/3 入口 + 方案1/3 隧道，共用端口 %s\n' "$ENC_PORT"
   printf '      "tag": "in-enc",\n'
-  printf '      "listen": "0.0.0.0",\n'
+  printf '      "listen": "::",\n'
   printf '      "port": %s,\n' "$ENC_PORT"
   printf '      "protocol": "vless",\n'
   printf '      "settings": {\n'
