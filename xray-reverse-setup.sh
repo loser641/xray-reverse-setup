@@ -43,8 +43,9 @@ umask 022
 PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
 export PATH
 
-# 脚本自身地址：lray 快捷命令、离线缓存都会用到
+# 脚本自身地址与版本：lray 用它做离线缓存和“拒绝旧版覆盖”的判断
 SCRIPT_URL="https://github.com/loser641/xray-reverse-setup/raw/main/xray-reverse-setup.sh"
+SCRIPT_REV=2
 
 CONF="/usr/local/etc/xray/config.json"
 STATE="/usr/local/etc/xray/xray-setup.state"
@@ -359,7 +360,21 @@ if [ -z "${LRAY_OFFLINE:-}" ]; then
 fi
 
 if [ "$_ok" -eq 0 ] && head -n 1 "$_tmp" 2>/dev/null | grep -q '^#!/bin/sh'; then
-  mv "$_tmp" "$CACHE"
+  # GitHub raw 的 CDN 可能短暂返回旧版：远端版本更旧时保留本地缓存
+  _new_rev=$(sed -n 's/^SCRIPT_REV=//p' "$_tmp" 2>/dev/null | head -n 1)
+  _cur_rev=$(sed -n 's/^SCRIPT_REV=//p' "$CACHE" 2>/dev/null | head -n 1)
+  _use_new=1
+  if [ -n "$_cur_rev" ] && [ -z "$_new_rev" ]; then
+    _use_new=0
+  elif [ -n "$_cur_rev" ] && [ -n "$_new_rev" ] && [ "$_new_rev" -lt "$_cur_rev" ] 2>/dev/null; then
+    _use_new=0
+  fi
+  if [ "$_use_new" = "1" ]; then
+    mv "$_tmp" "$CACHE"
+  else
+    rm -f "$_tmp"
+    echo "[!] 远端脚本版本较旧（可能是 CDN 缓存），继续使用本地缓存。" >&2
+  fi
 else
   rm -f "$_tmp"
   if [ -f "$CACHE" ]; then
